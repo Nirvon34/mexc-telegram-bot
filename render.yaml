@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: mexc-telegram-bot
+    env: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
