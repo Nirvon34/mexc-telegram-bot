@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Swing Anchored VWAP → Telegram (MEXC, EURUSDT по умолчанию)
+# + Эмит торговых событий в локальную шину (bus.emit) для автоторговли в MT5
 
 import os
 import time
@@ -13,6 +14,9 @@ import pandas as pd
 from dotenv import load_dotenv
 from telegram import Bot
 
+# NEW: внутренняя шина сигналов
+from bus import emit  # emit(symbol: str, signal: 'buy'|'sell', price=None, meta=None)
+
 # ────────────────────────── ENV ──────────────────────────
 load_dotenv()
 
@@ -21,7 +25,10 @@ TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # MEXC
 MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()   # EUR/USDT вместо EUR/USD
-MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "10m").strip()      # 1m/5m/15m/30m/60m/4h/1d/1W/1M
+MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "10m").strip()     # 1m/5m/15m/30m/60m/4h/1d/1W/1M
+
+# Куда публиковать для MT5 (символ в терминах брокера)
+EMIT_SYMBOL   = os.getenv("EMIT_SYMBOL", "EURUSD").strip()    # <— этот символ уйдёт в очередь /feed
 
 # Параметры
 LEN_FX     = int(os.getenv("SAVW_LENGTH", "67"))
@@ -85,8 +92,6 @@ def to_py_bool(x):
 def load_mexc(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     """
     GET https://api.mexc.com/api/v3/klines?symbol=...&interval=...&limit=...
-    MEXC может вернуть 8 полей (t,o,h,l,c,vol,closeTime,turnover) или 12 как у Binance.
-    Делаем маппинг по длине строки.
     """
     url = "https://api.mexc.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -103,16 +108,11 @@ def load_mexc(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     elif row_len == 8:
         cols = ["t","o","h","l","c","v","t2","q"]
     else:
-        # универсально: просто сгенерируем индексы и дальше возьмём нужные
         cols = list(range(row_len))
 
     df = pd.DataFrame(k, columns=cols)
+    df = df.rename(columns={0:"t", 1:"o", 2:"h", 3:"l", 4:"c"})
 
-    # Переименуем, если колонки числовые
-    rename_map = {0:"t", 1:"o", 2:"h", 3:"l", 4:"c"}
-    df = df.rename(columns=rename_map)
-
-    # Обязательные колонки для расчётов
     for need in ["t","o","h","l","c"]:
         if need not in df.columns:
             raise RuntimeError(f"MEXC формат неожиданен: нет колонки '{need}' (len={row_len})")
@@ -152,6 +152,11 @@ class Task:
         print(text)
         send_msg(text)
 
+    # NEW: эмит события в очередь для MT5
+    def _emit_trade(self, side: str, price: float | None):
+        ev = emit(EMIT_SYMBOL, side, price=price, meta={"src": "mexc_savw", "mexc_symbol": self.mexc_symbol})
+        print(f"EMIT ▶ {ev['symbol']} → {ev['signal']} @ {price}")
+
     def load_df(self) -> pd.DataFrame:
         df = load_mexc(self.mexc_symbol, self.mexc_interval)
         print(f"[MEXC] {self.label}: ОК ({len(df)} баров)")
@@ -187,8 +192,12 @@ class Task:
 
             signal_up = (curr is True) and (prev is not True)
             signal_dn = (curr is False) and (prev is not False)
-            if signal_up or signal_dn:
-                self._msg_signal(lt, price, signal_up)
+            if signal_up:
+                self._msg_signal(lt, price, True)
+                self._emit_trade("buy", price)   # NEW: отправка в очередь
+            elif signal_dn:
+                self._msg_signal(lt, price, False)
+                self._emit_trade("sell", price)  # NEW: отправка в очередь
 
             self.last_state = curr
             self.last_bar_time = lt
