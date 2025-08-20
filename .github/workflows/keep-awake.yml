@@ -1,0 +1,12 @@
+name: Keep Render Awake
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping
+        run: curl -fsS "https://mexc-telegram-bot-1xd7.onrender.com/?_=$(date +%s)"
+
+
