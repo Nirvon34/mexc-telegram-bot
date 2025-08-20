@@ -1,21 +1,22 @@
-# app.py
+# app.py — FastAPI: health, /tv, /push, /feed + запуск воркера MEXC
 import os, threading, requests
 from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 
-# ───────────── ENV ─────────────
+# ── ENV
+from dotenv import load_dotenv
+load_dotenv(override=True)
 TOKEN  = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SECRET = os.getenv("TV_SECRET", "").strip()
 
-# ────────── FastAPI/worker ─────
+# ── FastAPI/worker
 app = FastAPI()
 _started = False
 _lock = threading.Lock()
 
-# если есть твой бесконечный воркер — запускаем один раз
 try:
     from bot import main as worker_main  # бесконечный опрос MEXC
 except Exception:
@@ -35,12 +36,11 @@ def start_worker_once():
 def _startup():
     start_worker_once()
 
-# health: поддерживаем GET и HEAD
+# ── health (GET/HEAD)
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"ok": True}
 
-# ─────────── helpers ───────────
 def send_tg(text: str):
     if not (TOKEN and CHAT):
         return
@@ -53,31 +53,7 @@ def send_tg(text: str):
     except Exception as e:
         print("TG send error:", e)
 
-# ───────── шина сигналов ───────
-QUEUE: deque[Dict[str, Any]] = deque(maxlen=500)
-q_lock = threading.Lock()
-
-def _emit(symbol: str, signal: str, price: float | None = None, meta: Dict[str, Any] | None = None):
-    ev = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "symbol": (symbol or "EURUSD").upper().replace(":", "").replace(".", ""),
-        "signal": signal.lower(),                   # 'buy' / 'sell'
-        "price": price,
-        "meta": meta or {},
-    }
-    with q_lock:
-        QUEUE.append(ev)
-    return ev
-
-def _drain():
-    with q_lock:
-        items = list(QUEUE)
-        QUEUE.clear()
-    return items
-
-# ─────────── маршруты ──────────
-
-# Старый вебхук (оставляем как был)
+# ── старый хук (оставляем для совместимости)
 @app.post("/tv")
 async def tv(req: Request):
     data = await req.json()
@@ -91,11 +67,15 @@ async def tv(req: Request):
     send_tg(f"TV ▶ {sym} {tf} {act} @ {px}\n{t}")
     return {"status": "ok"}
 
-# НОВОЕ: ручной пуш сигнала
+# ── внутренняя очередь сигналов
+QUEUE: deque[Dict[str, Any]] = deque(maxlen=500)
+q_lock = threading.Lock()
+
 @app.post("/push")
 async def push(req: Request):
     """
-    Тело: {"secret":"...","symbol":"EURUSD","signal":"buy|sell","price":1.2345}
+    POST /push
+    body: {"secret":"...","symbol":"EURUSD","signal":"buy|sell","price":1.2345}
     """
     data = await req.json()
     if SECRET and data.get("secret") != SECRET:
@@ -105,19 +85,28 @@ async def push(req: Request):
     if signal not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="signal must be 'buy' or 'sell'")
 
-    symbol = str(data.get("symbol", "EURUSD"))
-    price  = data.get("price")
-    ev = _emit(symbol, signal, price)
+    symbol = str(data.get("symbol", "EURUSD")).upper().replace(":", "")
+    ev = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "signal": signal,
+        "price": data.get("price"),
+        "meta": data.get("meta") or {},
+    }
+    with q_lock:
+        QUEUE.append(ev)
     try:
-        send_tg(f"SIG ▶ {ev['symbol']} → {ev['signal'].upper()} @ {price if price is not None else '—'}")
+        send_tg(f"SIG ▶ {symbol} → {signal.upper()} @ {ev['price'] if ev['price'] is not None else '—'}")
     except Exception:
         pass
     return {"ok": True, "queued": len(QUEUE)}
 
-# НОВОЕ: выдача очереди для моста
 @app.get("/feed")
 def feed(secret: str = ""):
+    """Клиент (tv2mt5.py) забирает и очищает очередь."""
     if SECRET and secret != SECRET:
         raise HTTPException(status_code=401, detail="bad secret")
-    return {"ok": True, "events": _drain()}
-
+    with q_lock:
+        items = list(QUEUE)
+        QUEUE.clear()
+    return {"ok": True, "events": items}
