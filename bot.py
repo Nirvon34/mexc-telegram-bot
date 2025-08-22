@@ -1,280 +1,333 @@
 # -*- coding: utf-8 -*-
-# Donchian Bias Breakout → Telegram + emit в шину для MT5 (bus.emit)
-# Забирает свечи с MEXC, считает EMA/ATR/ADX/Дончиан, выдаёт сигнал на ЗАКРЫТИИ бара.
+# Regime Switcher (Donchian Trend Breakout + Range Reversion) → Telegram + emit в MT5
+# Основано на вашем рабочем шаблоне SAVW: та же структура, та же отправка в TG и emit()
 
-import os
-import time
+import os, time, asyncio, requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-
-import numpy as np
-import pandas as pd
-import requests
+import numpy as np, pandas as pd
 from dotenv import load_dotenv
 from telegram import Bot
 
-# внутренняя шина событий; должна быть реализована в bus.py:
-#   emit(symbol, 'buy'|'sell', price=None, meta=None)
-from bus import emit  # type: ignore
+from bus import emit  # emit(symbol, 'buy'|'sell', price=None, meta=None)
 
-# ─────────── ENV ───────────
+# ── ENV
 load_dotenv(override=True)
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TG_TOKEN      = os.getenv("TELEGRAM_TOKEN", "").strip()
-TG_CHAT       = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
 MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "5m").strip()
-POLL_DELAY    = float(os.getenv("POLL_DELAY", "60"))  # сек
-TZ_NAME       = os.getenv("TZ", "Europe/Moscow")
-EMIT_SYMBOL   = os.getenv("EMIT_SYMBOL", "EURUSD").strip()  # тикер для MT5
+EMIT_SYMBOL   = os.getenv("EMIT_SYMBOL", "EURUSD").strip()  # что будет торговать MT5
 
-# Параметры стратегии (можно задавать в Environment)
-CHLEN       = int(os.getenv("CHLEN", "40"))
+# Параметры нашей стратегии (дефолты — под M5)
+CHLEN       = int(os.getenv("CHLEN", "40"))          # период Дончиана
 ADX_LEN     = int(os.getenv("ADX_LEN", "14"))
 ADX_MIN     = float(os.getenv("ADX_MIN", "24"))
 ATR_LEN     = int(os.getenv("ATR_LEN", "14"))
-ATR_MIN_PC  = float(os.getenv("ATR_MIN_PC", "0.018"))  # 1.8% от цены
-BUF_ATR     = float(os.getenv("BUF_ATR", "0.20"))      # буфер пробоя в ATR
-DIST_SLOW   = float(os.getenv("DIST_SLOW", "0.6"))     # мин. дистанция от EMA200 в ATR
+ATR_MIN_PC  = float(os.getenv("ATR_MIN_PC", "0.018"))   # 1.8% от цены
+BUF_ATR     = float(os.getenv("BUF_ATR", "0.20"))       # буфер пробоя в ATR
+DIST_SLOW   = float(os.getenv("DIST_SLOW", "0.6"))      # мин. дистанция от EMA200 в ATR
 
-# MM (информационно — исполняется в tv2mt5, тут только в meta)
-TP1_R       = float(os.getenv("TP1_R", "1.0"))
-TP1_SHARE   = float(os.getenv("TP1_SHARE", "0.40"))
-TP_R        = float(os.getenv("TP_R", "2.6"))
-SL_ATR      = float(os.getenv("SL_ATR", "1.2"))
-BE_R        = float(os.getenv("BE_R", "0.8"))
+# Опционный блок mean-reversion (если тренда нет)
+USE_MR   = os.getenv("USE_MR", "1").strip() != "0"
+DEV_ATR  = float(os.getenv("DEV_ATR", "1.2"))           # отклонение от EMA50 в ATR
+RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
+RSI_LOW  = float(os.getenv("RSI_LOW", "35"))
+RSI_HIGH = float(os.getenv("RSI_HIGH", "65"))
 
-# Telegram
-bot = Bot(TG_TOKEN) if TG_TOKEN and TG_CHAT else None
-TZ  = ZoneInfo(TZ_NAME)
+# Сессия/лимиты (формат как у вас: HHMM-HHMM, локальная TZ)
+SESSION     = os.getenv("SESSION", "0700-1800").strip()
+COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "40"))
+MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "2"))
 
-# Заголовки для обхода 403 на MEXC
+POLL_DELAY = int(os.getenv("POLL_DELAY", "60"))
+TZ_NAME    = os.getenv("TZ", "Europe/Belgrade").strip()
+try:
+    TZ_LOCAL = ZoneInfo(TZ_NAME)
+except Exception:
+    TZ_LOCAL = ZoneInfo("Europe/Belgrade")
+
+# Запас на случай 403 от MEXC — «человеческие» заголовки (без фанатизма)
 HEADERS = {
-    "User-Agent": "mexc-telegram-bot/1.0 (+https://render.com)",
+    "User-Agent": "mexc-telegram-bot/1.0",
     "Accept": "application/json",
 }
 
-# ─────────── Утилиты ───────────
-
-def send_tg(text: str):
-    if not bot:
+# ── Telegram
+async def _send_async(text: str):
+    if not TG_TOKEN or not TG_CHAT:
+        print("⚠️ TELEGRAM_TOKEN/CHAT_ID не заданы. Сообщение:", text)
         return
+    async with Bot(TG_TOKEN) as bot:
+        await bot.send_message(chat_id=TG_CHAT, text=text, disable_web_page_preview=True)
+
+def send_msg(text: str):
     try:
-        bot.send_message(chat_id=TG_CHAT, text=text, disable_web_page_preview=True)
-    except Exception as e:
-        print("TG send error:", e)
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+    asyncio.run(_send_async(text))
 
+# ── helpers
+def drop_unclosed_last_bar(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    return df.iloc[:-1] if len(df) >= 1 else df
 
-def mexc_klines(symbol: str, interval: str, limit: int = 600) -> pd.DataFrame:
-    """
-    Пробуем публичный v3; если 403/ошибка — фолбэк на open/api v2.
-    Возвращает DF: open_time(ms), open, high, low, close, volume, close_time
-    """
-    cols = ["open_time", "open", "high", "low", "close", "volume", "close_time"]
+def fmt_time_local(ts_utc: datetime | pd.Timestamp) -> str:
+    if isinstance(ts_utc, pd.Timestamp):
+        dt = ts_utc.to_pydatetime().replace(tzinfo=timezone.utc)
+    else:
+        dt = ts_utc.replace(tzinfo=timezone.utc)
+    return dt.astimezone(TZ_LOCAL).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    # 1) Основной v3
-    url_v3 = "https://api.mexc.com/api/v3/klines"
+def in_session(now: datetime) -> bool:
+    """Проверка по локальному времени (как в pine input.session)."""
     try:
-        r = requests.get(
-            url_v3,
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            headers=HEADERS,
-            timeout=15,
-        )
-        if r.status_code == 403:
-            raise requests.HTTPError(f"403 Forbidden for {url_v3}")
-        r.raise_for_status()
-        arr = r.json()
-        data = [[a[0], float(a[1]), float(a[2]), float(a[3]), float(a[4]), float(a[5]), a[6]] for a in arr]
-        return pd.DataFrame(data, columns=cols)
-    except Exception as e:
-        print("v3 klines failed → fallback v2:", e)
+        s, e = SESSION.split("-")
+        sh, sm = int(s[:2]), int(s[2:])
+        eh, em = int(e[:2]), int(e[2:])
+        local = now.astimezone(TZ_LOCAL)
+        t = local.hour*60 + local.minute
+        start = sh*60 + sm
+        end   = eh*60 + em
+        return start <= t <= end
+    except Exception:
+        return True
 
-    # 2) Фолбэк v2
-    url_v2 = "https://www.mexc.com/open/api/v2/market/kline"
-    sym_v2 = symbol if "_" in symbol else symbol.replace("USDT", "_USDT")
-    i_map = {
-        "1m": "Min1", "3m": "Min3", "5m": "Min5", "15m": "Min15", "30m": "Min30",
-        "1h": "Hour1", "2h": "Hour2", "4h": "Hour4", "6h": "Hour6", "8h": "Hour8", "12h": "Hour12",
-        "1d": "Day1", "1w": "Week1", "1M": "Month1"
-    }
-    i_v2 = i_map.get(interval.lower(), "Min5")
-    r2 = requests.get(
-        url_v2,
-        params={"symbol": sym_v2, "interval": i_v2, "limit": limit},
-        headers=HEADERS,
-        timeout=15,
-    )
-    r2.raise_for_status()
-    js = r2.json()
-    arr = js.get("data", [])
-    data = [[int(a["t"]) * 1000, float(a["o"]), float(a["h"]), float(a["l"]), float(a["c"]), float(a["v"]), None] for a in arr]
-    return pd.DataFrame(data, columns=cols)
+def rma(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(alpha=1.0/float(length), adjust=False).mean()
 
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
-def interval_to_htf(interval: str) -> str:
-    """
-    Авто-HTF:
-      M1..M15 → 4h;  M20/M30/1h → 1d;  H2..H12/D1 → 1w; иначе → 1M
-    """
-    i = interval.lower()
-    if i in ("1m", "3m", "5m", "15m"):
-        return "4h"
-    if i in ("20m", "30m", "1h"):
-        return "1d"
-    if i in ("2h", "4h", "6h", "8h", "12h", "1d"):
-        return "1w"
-    return "1M"
-
-
-def rma(s: pd.Series, length: int) -> pd.Series:
-    return s.ewm(alpha=1.0 / float(length), adjust=False).mean()
-
-
-def ema(s: pd.Series, length: int) -> pd.Series:
-    return s.ewm(span=length, adjust=False).mean()
-
+def rsi(series: pd.Series, length: int) -> pd.Series:
+    d = series.diff()
+    up = d.clip(lower=0.0)
+    dn = (-d).clip(lower=0.0)
+    rs = rma(up, length) / rma(dn, length).replace(0.0, np.nan)
+    out = 100.0 - (100.0 / (1.0 + rs))
+    return out.fillna(50.0)
 
 def atr_df(df: pd.DataFrame, length: int) -> pd.Series:
-    c, h, l = df["close"], df["high"], df["low"]
+    c, h, l = df["c"], df["h"], df["l"]
     prev = c.shift(1)
-    tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
     return rma(tr, length)
 
-
 def adx_df(df: pd.DataFrame, length: int) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
+    h, l, c = df["h"], df["l"], df["c"]
     up = h.diff()
     dn = -l.diff()
-    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    plus_dm  = np.where((up > dn) & (up > 0), up, 0.0)
     minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    tr = pd.concat([(h - l), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+    tr = pd.concat([(h-l), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
     tr_rma = rma(tr, length)
-    pdi = 100.0 * rma(pd.Series(plus_dm, index=df.index), length) / tr_rma.replace(0, np.nan)
-    mdi = 100.0 * rma(pd.Series(minus_dm, index=df.index), length) / tr_rma.replace(0, np.nan)
-    dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    pdi = 100.0 * rma(pd.Series(plus_dm, index=df.index), length) / tr_rma.replace(0.0, np.nan)
+    mdi = 100.0 * rma(pd.Series(minus_dm, index=df.index), length) / tr_rma.replace(0.0, np.nan)
+    dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0.0, np.nan)
     return rma(dx.fillna(0.0), length)
 
+def interval_to_htf(interval: str) -> str:
+    i = interval.lower()
+    if i in ("1m","3m","5m","15m"): return "4h"
+    if i in ("20m","30m","1h"):     return "1d"
+    if i in ("2h","4h","6h","8h","12h","1d"): return "1w"
+    return "1M"
 
-def make_signal() -> tuple[str | None, dict]:
-    """
-    ('buy'|'sell'|None, meta)
-    Логика = Pine: HTF-bias + Donchian breakout с буфером + ADX/ATR + тренд LTF.
-    """
-    # LTF
-    d = mexc_klines(MEXC_SYMBOL, MEXC_INTERVAL, limit=600)
-    # HTF
-    htf = interval_to_htf(MEXC_INTERVAL)
-    D = mexc_klines(MEXC_SYMBOL, htf, limit=400)
+# ── MEXC
+def load_mexc(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
+    url = "https://api.mexc.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    k = r.json()
+    if not isinstance(k, list) or not k:
+        raise RuntimeError("MEXC пусто")
+    row_len = len(k[0])
+    if row_len >= 12: cols = ["t","o","h","l","c","v","t2","q","n","tb","tq","ig"]
+    elif row_len == 8: cols = ["t","o","h","l","c","v","t2","q"]
+    else: cols = list(range(row_len))
+    df = pd.DataFrame(k, columns=cols).rename(columns={0:"t",1:"o",2:"h",3:"l",4:"c"})
+    for need in ["t","o","h","l","c"]:
+        if need not in df.columns: raise RuntimeError(f"Unexpected MEXC format: '{need}' missing")
+    df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    df[["o","h","l","c"]] = df[["o","h","l","c"]].astype(float)
+    df = df[["t","o","h","l","c"]].set_index("t").sort_index()
+    df = drop_unclosed_last_bar(df)
+    df["complete"] = True
+    return df
 
+# ── Стратегия
+def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, dict]:
+    """
+    Возвращает ('buy'|'sell'|None, meta) на закрытии текущего LTF-бара.
+    Логика = Pine: HTF-bias + Donchian breakout (+ MR, если тренда нет).
+    """
     # Индикаторы LTF
-    d["ema50"] = ema(d["close"], 50)
-    d["ema200"] = ema(d["close"], 200)
-    d["atr"] = atr_df(d, ATR_LEN)
-    d["adx"] = adx_df(d, ADX_LEN)
+    df = df_ltf.copy()
+    df["ema50"]  = ema(df["c"], 50)
+    df["ema200"] = ema(df["c"], 200)
+    df["atr"]    = atr_df(df, ATR_LEN)
+    df["adx"]    = adx_df(df, ADX_LEN)
+    df["rsi"]    = rsi(df["c"], RSI_LEN)
 
-    # HTF тренд
-    D["ema200"] = ema(D["close"], 200)
-    htf_up = (D["close"].iloc[-1] > D["ema200"].iloc[-1]) and (D["ema200"].iloc[-1] > D["ema200"].iloc[-2])
-    htf_dn = (D["close"].iloc[-1] < D["ema200"].iloc[-1]) and (D["ema200"].iloc[-1] < D["ema200"].iloc[-2])
+    c    = df["c"].iloc[-1]
+    ema50  = df["ema50"].iloc[-1]
+    ema200 = df["ema200"].iloc[-1]
+    atr    = df["atr"].iloc[-1]
+    adx    = df["adx"].iloc[-1]
+    rsi_v  = df["rsi"].iloc[-1]
 
     # Дончиан prev
-    don_hi_prev = d["high"].rolling(CHLEN).max().shift(1).iloc[-1]
-    don_lo_prev = d["low"].rolling(CHLEN).min().shift(1).iloc[-1]
+    don_hi_prev = df["h"].rolling(CHLEN).max().shift(1).iloc[-1]
+    don_lo_prev = df["l"].rolling(CHLEN).min().shift(1).iloc[-1]
+
+    # HTF тренд
+    D = df_htf.copy()
+    D["ema200"] = ema(D["c"], 200)
+    htf_up = (D["c"].iloc[-1] > D["ema200"].iloc[-1]) and (D["ema200"].iloc[-1] > D["ema200"].iloc[-2])
+    htf_dn = (D["c"].iloc[-1] < D["ema200"].iloc[-1]) and (D["ema200"].iloc[-1] < D["ema200"].iloc[-2])
 
     # Фильтры
-    c = d["close"].iloc[-1]
-    ema50 = d["ema50"].iloc[-1]
-    ema200 = d["ema200"].iloc[-1]
-    atr = d["atr"].iloc[-1]
-    adx = d["adx"].iloc[-1]
-
     trend_up = (c > ema50) and (ema50 > ema200)
     trend_dn = (c < ema50) and (ema50 < ema200)
-    atr_ok = (atr / c * 100.0) >= (ATR_MIN_PC * 100.0)
-    adx_ok = adx >= ADX_MIN
+    atr_ok   = (atr / c * 100.0) >= (ATR_MIN_PC * 100.0)
+    adx_ok   = adx >= ADX_MIN
     far_slow = abs(c - ema200) >= (DIST_SLOW * atr)
 
-    long_break = c > (don_hi_prev + BUF_ATR * atr)
+    long_break  = c > (don_hi_prev + BUF_ATR * atr)
     short_break = c < (don_lo_prev - BUF_ATR * atr)
 
-    go_long = htf_up and trend_up and atr_ok and adx_ok and far_slow and long_break
+    go_long  = htf_up and trend_up and atr_ok and adx_ok and far_slow and long_break
     go_short = htf_dn and trend_dn and atr_ok and adx_ok and far_slow and short_break
+
+    side = None
+    regime = "trend"
+    if go_long and not go_short:
+        side = "buy"
+    elif go_short and not go_long:
+        side = "sell"
+    elif USE_MR and not adx_ok:
+        # Mean-reversion на слабом тренде
+        regime = "range"
+        dev = DEV_ATR * atr
+        long_mr  = (c < ema50 - dev) and (rsi_v < RSI_LOW)
+        short_mr = (c > ema50 + dev) and (rsi_v > RSI_HIGH)
+        if long_mr and not short_mr:
+            side = "buy"
+        elif short_mr and not long_mr:
+            side = "sell"
 
     meta = {
         "symbol": MEXC_SYMBOL,
         "interval": MEXC_INTERVAL,
-        "htf": htf,
         "price": float(c),
-        "don_hi_prev": float(don_hi_prev),
-        "don_lo_prev": float(don_lo_prev),
         "ema50": float(ema50),
         "ema200": float(ema200),
         "atr": float(atr),
+        "atr_pc": float(atr/c*100.0) if c else None,
         "adx": float(adx),
-        "htf_up": htf_up,
-        "htf_dn": htf_dn,
-        "trend_up": trend_up,
-        "trend_dn": trend_dn,
-        "atr_ok": atr_ok,
-        "adx_ok": adx_ok,
-        "far_slow": far_slow,
-        "long_break": long_break,
-        "short_break": short_break,
-        "mm": {"SL_ATR": SL_ATR, "TP1_R": TP1_R, "TP1_SHARE": TP1_SHARE, "TP_R": TP_R, "BE_R": BE_R},
+        "rsi": float(rsi_v),
+        "htf_up": bool(htf_up), "htf_dn": bool(htf_dn),
+        "trend_up": bool(trend_up), "trend_dn": bool(trend_dn),
+        "atr_ok": bool(atr_ok), "adx_ok": bool(adx_ok), "far_slow": bool(far_slow),
+        "don_hi_prev": float(don_hi_prev), "don_lo_prev": float(don_lo_prev),
+        "regime": regime,
     }
+    return side, meta
 
-    if go_long and not go_short:
-        return "buy", meta
-    if go_short and not go_long:
-        return "sell", meta
-    return None, meta
+# ── Task
+class Task:
+    def __init__(self, label: str, poll_delay: int, mexc_symbol: str, mexc_interval: str):
+        self.label = label
+        self.poll_delay = poll_delay
+        self.mexc_symbol = mexc_symbol
+        self.mexc_interval = mexc_interval
 
+        self.last_bar_time = None
+        self.last_tick_ts = 0.0
+        self.last_signal_side: str | None = None
 
-def fmt_dt(ts_ms: int) -> str:
-    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        self.last_trade_index: int | None = None
+        self.trades_today = 0
+        self.cur_day = None  # для дневного лимита
 
+    def _emit_trade(self, side: str, price: float | None, meta: dict):
+        ev = emit(EMIT_SYMBOL, side, price=price, meta={"src": "mexc_regime", **meta})
+        print(f"EMIT ▶ {EMIT_SYMBOL} → {side} @ {price} | {ev}")
 
-# ─────────── Main loop ───────────
-def main():
-    print(f"Start Donchian bot | {MEXC_SYMBOL} {MEXC_INTERVAL} | emit→ {EMIT_SYMBOL}")
-    last_bar_open = None
-    last_side_sent = None
+    def _ok_limits(self, df_len: int) -> bool:
+        # дневной лимит
+        now_local = datetime.now(tz=TZ_LOCAL)
+        d = (now_local.year, now_local.month, now_local.day)
+        if self.cur_day != d:
+            self.cur_day = d
+            self.trades_today = 0
+        if self.trades_today >= MAX_TRADES_DAY:
+            return False
+        # кулдаун в барах
+        if self.last_trade_index is None:
+            return True
+        return (df_len - self.last_trade_index) >= COOLDOWN_BARS
 
-    while True:
+    def tick(self):
+        now = time.time()
+        if now - self.last_tick_ts < self.poll_delay:
+            return
+        self.last_tick_ts = now
         try:
-            # Берём 2 последних бара, чтобы отследить смену open_time (закрытие предыдущего)
-            df_last = mexc_klines(MEXC_SYMBOL, MEXC_INTERVAL, limit=2)
-            cur_open = int(df_last["open_time"].iloc[-1])
+            # LTF
+            df = load_mexc(self.mexc_symbol, self.mexc_interval)
+            if df.empty:
+                return
+            lt = df.index[-1]
+            if self.last_bar_time is not None and lt <= self.last_bar_time:
+                return
 
-            if last_bar_open is None:
-                last_bar_open = cur_open
+            # HTF
+            htf = interval_to_htf(self.mexc_interval)
+            df_htf = load_mexc(self.mexc_symbol, htf)
 
-            if cur_open != last_bar_open:
-                # Закрыт бар → считаем сигнал
-                side, meta = make_signal()
-                last_bar_open = cur_open
+            side, meta = make_signal(df, df_htf)
+            price = float(meta.get("price", float(df["c"].iloc[-1])))
 
-                if side and side != last_side_sent:
-                    price = float(meta["price"])
-                    when = fmt_dt(cur_open)
-                    msg = (
-                        f"#{EMIT_SYMBOL} {side.upper()} | {when}\n"
-                        f"price={price:.5f} | adx={meta['adx']:.1f} atr%={(meta['atr']/price*100):.2f}%\n"
-                        f"HTF={meta['htf']} trend: up={meta['htf_up']} dn={meta['htf_dn']}\n"
-                        f"Donchian prev: H={meta['don_hi_prev']:.5f} L={meta['don_lo_prev']:.5f}"
-                    )
-                    print(msg)
-                    send_tg(msg)
+            # ограничения
+            if side and self._ok_limits(len(df)) and in_session(datetime.now(timezone.utc)):
+                when_local = fmt_time_local(lt)
+                msg = (f"#{EMIT_SYMBOL} {side.upper()} | {when_local}\n"
+                       f"price={price:.5f}  adx={meta['adx']:.1f}  atr%={meta['atr_pc']:.2f}%  regime={meta['regime']}\n"
+                       f"HTF trend: up={meta['htf_up']} dn={meta['htf_dn']}  "
+                       f"Donchian prev: H={meta['don_hi_prev']:.5f} L={meta['don_lo_prev']:.5f}")
+                print(msg); send_msg(msg)
+                self._emit_trade(side, price, meta)
+                self.last_signal_side = side
+                self.last_trade_index = len(df)
+                self.trades_today += 1
+            else:
+                print(f"[{self.label}] no signal | bar {lt}")
 
-                    # событие в очередь для /feed
-                    emit(EMIT_SYMBOL, side, price=price, meta=meta)
-                    last_side_sent = side
-                else:
-                    print(f"No signal | {fmt_dt(cur_open)}")
+            self.last_bar_time = lt
 
         except Exception as e:
-            print("loop error:", e)
+            print(f"[{self.label}] Ошибка: {e}")
+
+def main():
+    task = Task(
+        label=f"{MEXC_SYMBOL} ({MEXC_INTERVAL})",
+        poll_delay=POLL_DELAY,
+        mexc_symbol=MEXC_SYMBOL,
+        mexc_interval=MEXC_INTERVAL,
+    )
+    print(f"Бот запущен. Источник: MEXC spot klines. TZ: {TZ_NAME}")
+    send_msg(f"🚀 Бот запущен. Источник: MEXC\nЗадача: {MEXC_SYMBOL} ({MEXC_INTERVAL})\nTZ: {TZ_NAME}")
+    while True:
+        task.tick()
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
 
         time.sleep(POLL_DELAY)
 
