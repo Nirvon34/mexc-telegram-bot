@@ -2,10 +2,14 @@
 # Regime Switcher (Donchian Trend Breakout + Range Reversion) → Telegram + emit в MT5
 # Основано на вашем рабочем шаблоне SAVW: та же структура, та же отправка в TG и emit()
 
-import os, time, asyncio, requests
+import os
+import time
+import asyncio
+import requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-import numpy as np, pandas as pd
+import numpy as np
+import pandas as pd
 from dotenv import load_dotenv
 from telegram import Bot
 
@@ -14,41 +18,41 @@ from bus import emit  # emit(symbol, 'buy'|'sell', price=None, meta=None)
 # ── ENV
 load_dotenv(override=True)
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
+MEXC_SYMBOL = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
 MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "5m").strip()
-EMIT_SYMBOL   = os.getenv("EMIT_SYMBOL", "EURUSD").strip()  # что будет торговать MT5
+EMIT_SYMBOL = os.getenv("EMIT_SYMBOL", "EURUSD").strip()  # что будет торговать MT5
 
 # Параметры нашей стратегии (дефолты — под M5)
-CHLEN       = int(os.getenv("CHLEN", "40"))          # период Дончиана
-ADX_LEN     = int(os.getenv("ADX_LEN", "14"))
-ADX_MIN     = float(os.getenv("ADX_MIN", "24"))
-ATR_LEN     = int(os.getenv("ATR_LEN", "14"))
-ATR_MIN_PC  = float(os.getenv("ATR_MIN_PC", "0.018"))   # 1.8% от цены
-BUF_ATR     = float(os.getenv("BUF_ATR", "0.20"))       # буфер пробоя в ATR
-DIST_SLOW   = float(os.getenv("DIST_SLOW", "0.6"))      # мин. дистанция от EMA200 в ATR
+CHLEN = int(os.getenv("CHLEN", "40"))          # период Дончиана
+ADX_LEN = int(os.getenv("ADX_LEN", "14"))
+ADX_MIN = float(os.getenv("ADX_MIN", "24"))
+ATR_LEN = int(os.getenv("ATR_LEN", "14"))
+ATR_MIN_PC = float(os.getenv("ATR_MIN_PC", "0.018"))   # 1.8% от цены
+BUF_ATR = float(os.getenv("BUF_ATR", "0.20"))          # буфер пробоя в ATR
+DIST_SLOW = float(os.getenv("DIST_SLOW", "0.6"))       # мин. дистанция от EMA200 в ATR
 
 # Опционный блок mean-reversion (если тренда нет)
-USE_MR   = os.getenv("USE_MR", "1").strip() != "0"
-DEV_ATR  = float(os.getenv("DEV_ATR", "1.2"))           # отклонение от EMA50 в ATR
-RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
-RSI_LOW  = float(os.getenv("RSI_LOW", "35"))
+USE_MR = os.getenv("USE_MR", "1").strip() != "0"
+DEV_ATR = float(os.getenv("DEV_ATR", "1.2"))           # отклонение от EMA50 в ATR
+RSI_LEN = int(os.getenv("RSI_LEN", "14"))
+RSI_LOW = float(os.getenv("RSI_LOW", "35"))
 RSI_HIGH = float(os.getenv("RSI_HIGH", "65"))
 
-# Сессия/лимиты (формат как у вас: HHMM-HHMM, локальная TZ)
-SESSION     = os.getenv("SESSION", "0700-1800").strip()
+# Сессия/лимиты (формат: HHMM-HHMM, локальная TZ)
+SESSION = os.getenv("SESSION", "0700-1800").strip()
 COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "40"))
 MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "2"))
 
 POLL_DELAY = int(os.getenv("POLL_DELAY", "60"))
-TZ_NAME    = os.getenv("TZ", "Europe/Belgrade").strip()
+TZ_NAME = os.getenv("TZ", "Europe/Belgrade").strip()
 try:
     TZ_LOCAL = ZoneInfo(TZ_NAME)
 except Exception:
     TZ_LOCAL = ZoneInfo("Europe/Belgrade")
 
-# Запас на случай 403 от MEXC — «человеческие» заголовки (без фанатизма)
+# Нейтральные заголовки, чтобы реже ловить 403 на MEXC
 HEADERS = {
     "User-Agent": "mexc-telegram-bot/1.0",
     "Accept": "application/json",
@@ -83,21 +87,21 @@ def fmt_time_local(ts_utc: datetime | pd.Timestamp) -> str:
     return dt.astimezone(TZ_LOCAL).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def in_session(now: datetime) -> bool:
-    """Проверка по локальному времени (как в pine input.session)."""
+    """Проверка по локальному времени."""
     try:
         s, e = SESSION.split("-")
         sh, sm = int(s[:2]), int(s[2:])
         eh, em = int(e[:2]), int(e[2:])
         local = now.astimezone(TZ_LOCAL)
-        t = local.hour*60 + local.minute
-        start = sh*60 + sm
-        end   = eh*60 + em
+        t = local.hour * 60 + local.minute
+        start = sh * 60 + sm
+        end = eh * 60 + em
         return start <= t <= end
     except Exception:
         return True
 
 def rma(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(alpha=1.0/float(length), adjust=False).mean()
+    return series.ewm(alpha=1.0 / float(length), adjust=False).mean()
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -113,16 +117,16 @@ def rsi(series: pd.Series, length: int) -> pd.Series:
 def atr_df(df: pd.DataFrame, length: int) -> pd.Series:
     c, h, l = df["c"], df["h"], df["l"]
     prev = c.shift(1)
-    tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
+    tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
     return rma(tr, length)
 
 def adx_df(df: pd.DataFrame, length: int) -> pd.Series:
     h, l, c = df["h"], df["l"], df["c"]
     up = h.diff()
     dn = -l.diff()
-    plus_dm  = np.where((up > dn) & (up > 0), up, 0.0)
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
     minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    tr = pd.concat([(h-l), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
+    tr = pd.concat([(h - l), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
     tr_rma = rma(tr, length)
     pdi = 100.0 * rma(pd.Series(plus_dm, index=df.index), length) / tr_rma.replace(0.0, np.nan)
     mdi = 100.0 * rma(pd.Series(minus_dm, index=df.index), length) / tr_rma.replace(0.0, np.nan)
@@ -131,9 +135,12 @@ def adx_df(df: pd.DataFrame, length: int) -> pd.Series:
 
 def interval_to_htf(interval: str) -> str:
     i = interval.lower()
-    if i in ("1m","3m","5m","15m"): return "4h"
-    if i in ("20m","30m","1h"):     return "1d"
-    if i in ("2h","4h","6h","8h","12h","1d"): return "1w"
+    if i in ("1m", "3m", "5m", "15m"):
+        return "4h"
+    if i in ("20m", "30m", "1h"):
+        return "1d"
+    if i in ("2h", "4h", "6h", "8h", "12h", "1d"):
+        return "1w"
     return "1M"
 
 # ── MEXC
@@ -146,39 +153,43 @@ def load_mexc(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     if not isinstance(k, list) or not k:
         raise RuntimeError("MEXC пусто")
     row_len = len(k[0])
-    if row_len >= 12: cols = ["t","o","h","l","c","v","t2","q","n","tb","tq","ig"]
-    elif row_len == 8: cols = ["t","o","h","l","c","v","t2","q"]
-    else: cols = list(range(row_len))
-    df = pd.DataFrame(k, columns=cols).rename(columns={0:"t",1:"o",2:"h",3:"l",4:"c"})
-    for need in ["t","o","h","l","c"]:
-        if need not in df.columns: raise RuntimeError(f"Unexpected MEXC format: '{need}' missing")
+    if row_len >= 12:
+        cols = ["t", "o", "h", "l", "c", "v", "t2", "q", "n", "tb", "tq", "ig"]
+    elif row_len == 8:
+        cols = ["t", "o", "h", "l", "c", "v", "t2", "q"]
+    else:
+        cols = list(range(row_len))
+    df = pd.DataFrame(k, columns=cols).rename(columns={0: "t", 1: "o", 2: "h", 3: "l", 4: "c"})
+    for need in ["t", "o", "h", "l", "c"]:
+        if need not in df.columns:
+            raise RuntimeError(f"Unexpected MEXC format: '{need}' missing")
     df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df[["o","h","l","c"]] = df[["o","h","l","c"]].astype(float)
-    df = df[["t","o","h","l","c"]].set_index("t").sort_index()
+    df[["o", "h", "l", "c"]] = df[["o", "h", "l", "c"]].astype(float)
+    df = df[["t", "o", "h", "l", "c"]].set_index("t").sort_index()
     df = drop_unclosed_last_bar(df)
     df["complete"] = True
     return df
 
 # ── Стратегия
-def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, dict]:
+def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str | None, dict]:
     """
     Возвращает ('buy'|'sell'|None, meta) на закрытии текущего LTF-бара.
-    Логика = Pine: HTF-bias + Donchian breakout (+ MR, если тренда нет).
+    Логика = HTF-bias + Donchian breakout (+ MR, если тренда нет).
     """
-    # Индикаторы LTF
+    # LTF индикаторы
     df = df_ltf.copy()
-    df["ema50"]  = ema(df["c"], 50)
+    df["ema50"] = ema(df["c"], 50)
     df["ema200"] = ema(df["c"], 200)
-    df["atr"]    = atr_df(df, ATR_LEN)
-    df["adx"]    = adx_df(df, ADX_LEN)
-    df["rsi"]    = rsi(df["c"], RSI_LEN)
+    df["atr"] = atr_df(df, ATR_LEN)
+    df["adx"] = adx_df(df, ADX_LEN)
+    df["rsi"] = rsi(df["c"], RSI_LEN)
 
-    c    = df["c"].iloc[-1]
-    ema50  = df["ema50"].iloc[-1]
+    c = df["c"].iloc[-1]
+    ema50 = df["ema50"].iloc[-1]
     ema200 = df["ema200"].iloc[-1]
-    atr    = df["atr"].iloc[-1]
-    adx    = df["adx"].iloc[-1]
-    rsi_v  = df["rsi"].iloc[-1]
+    atr = df["atr"].iloc[-1]
+    adx = df["adx"].iloc[-1]
+    rsi_v = df["rsi"].iloc[-1]
 
     # Дончиан prev
     don_hi_prev = df["h"].rolling(CHLEN).max().shift(1).iloc[-1]
@@ -193,14 +204,14 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
     # Фильтры
     trend_up = (c > ema50) and (ema50 > ema200)
     trend_dn = (c < ema50) and (ema50 < ema200)
-    atr_ok   = (atr / c * 100.0) >= (ATR_MIN_PC * 100.0)
-    adx_ok   = adx >= ADX_MIN
+    atr_ok = (atr / c * 100.0) >= (ATR_MIN_PC * 100.0)
+    adx_ok = adx >= ADX_MIN
     far_slow = abs(c - ema200) >= (DIST_SLOW * atr)
 
-    long_break  = c > (don_hi_prev + BUF_ATR * atr)
+    long_break = c > (don_hi_prev + BUF_ATR * atr)
     short_break = c < (don_lo_prev - BUF_ATR * atr)
 
-    go_long  = htf_up and trend_up and atr_ok and adx_ok and far_slow and long_break
+    go_long = htf_up and trend_up and atr_ok and adx_ok and far_slow and long_break
     go_short = htf_dn and trend_dn and atr_ok and adx_ok and far_slow and short_break
 
     side = None
@@ -213,7 +224,7 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
         # Mean-reversion на слабом тренде
         regime = "range"
         dev = DEV_ATR * atr
-        long_mr  = (c < ema50 - dev) and (rsi_v < RSI_LOW)
+        long_mr = (c < ema50 - dev) and (rsi_v < RSI_LOW)
         short_mr = (c > ema50 + dev) and (rsi_v > RSI_HIGH)
         if long_mr and not short_mr:
             side = "buy"
@@ -227,13 +238,18 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
         "ema50": float(ema50),
         "ema200": float(ema200),
         "atr": float(atr),
-        "atr_pc": float(atr/c*100.0) if c else None,
+        "atr_pc": float(atr / c * 100.0) if c else None,
         "adx": float(adx),
         "rsi": float(rsi_v),
-        "htf_up": bool(htf_up), "htf_dn": bool(htf_dn),
-        "trend_up": bool(trend_up), "trend_dn": bool(trend_dn),
-        "atr_ok": bool(atr_ok), "adx_ok": bool(adx_ok), "far_slow": bool(far_slow),
-        "don_hi_prev": float(don_hi_prev), "don_lo_prev": float(don_lo_prev),
+        "htf_up": bool(htf_up),
+        "htf_dn": bool(htf_dn),
+        "trend_up": bool(trend_up),
+        "trend_dn": bool(trend_dn),
+        "atr_ok": bool(atr_ok),
+        "adx_ok": bool(adx_ok),
+        "far_slow": bool(far_slow),
+        "don_hi_prev": float(don_hi_prev),
+        "don_lo_prev": float(don_lo_prev),
         "regime": regime,
     }
     return side, meta
@@ -296,11 +312,14 @@ class Task:
             # ограничения
             if side and self._ok_limits(len(df)) and in_session(datetime.now(timezone.utc)):
                 when_local = fmt_time_local(lt)
-                msg = (f"#{EMIT_SYMBOL} {side.upper()} | {when_local}\n"
-                       f"price={price:.5f}  adx={meta['adx']:.1f}  atr%={meta['atr_pc']:.2f}%  regime={meta['regime']}\n"
-                       f"HTF trend: up={meta['htf_up']} dn={meta['htf_dn']}  "
-                       f"Donchian prev: H={meta['don_hi_prev']:.5f} L={meta['don_lo_prev']:.5f}")
-                print(msg); send_msg(msg)
+                msg = (
+                    f"#{EMIT_SYMBOL} {side.upper()} | {when_local}\n"
+                    f"price={price:.5f}  adx={meta['adx']:.1f}  atr%={meta['atr_pc']:.2f}%  regime={meta['regime']}\n"
+                    f"HTF trend: up={meta['htf_up']} dn={meta['htf_dn']}  "
+                    f"Donchian prev: H={meta['don_hi_prev']:.5f} L={meta['don_lo_prev']:.5f}"
+                )
+                print(msg)
+                send_msg(msg)
                 self._emit_trade(side, price, meta)
                 self.last_signal_side = side
                 self.last_trade_index = len(df)
@@ -324,13 +343,7 @@ def main():
     send_msg(f"🚀 Бот запущен. Источник: MEXC\nЗадача: {MEXC_SYMBOL} ({MEXC_INTERVAL})\nTZ: {TZ_NAME}")
     while True:
         task.tick()
-        time.sleep(1)
-
-if __name__ == "__main__":
-    main()
-
-        time.sleep(POLL_DELAY)
-
+        time.sleep(1)  # фикс: одинаковый уровень отступа, безопасная частота цикла
 
 if __name__ == "__main__":
     main()
