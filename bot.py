@@ -17,6 +17,9 @@ from telegram import Bot
 
 from bus import emit  # emit(symbol, 'buy'|'sell', price=None, meta=None)
 
+# ── Флаг: слать стартовое сообщение один раз за процесс
+_START_MSG_SENT = False
+
 # ── ENV
 load_dotenv(override=True)
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -368,6 +371,7 @@ class Task:
             print(f"[{self.label}] Ошибка: {e}")
 
 def main():
+    global _START_MSG_SENT
     task = Task(
         label=f"{MEXC_SYMBOL} ({MEXC_INTERVAL})",
         poll_delay=POLL_DELAY,
@@ -375,8 +379,15 @@ def main():
         mexc_interval=MEXC_INTERVAL,
     )
     print(f"Бот запущен. Источник: MEXC spot klines (c fallback). TZ: {TZ_NAME}")
-    send_msg(f"🚀 Бот запущен. Источник: MEXC (fallback v2/Binance при 403)\n"
-             f"Задача: {MEXC_SYMBOL} ({MEXC_INTERVAL})\nTZ: {TZ_NAME}")
+
+    # Отправить стартовое сообщение ровно один раз за процесс
+    if not _START_MSG_SENT:
+        send_msg(
+            f"🚀 Бот запущен. Источник: MEXC (fallback v2/Binance при 403)\n"
+            f"Задача: {MEXC_SYMBOL} ({MEXC_INTERVAL})\nTZ: {TZ_NAME}"
+        )
+        _START_MSG_SENT = True
+
     while True:
         task.tick()
         time.sleep(1)  # частый цикл; сам tick ограничен POLL_DELAY
