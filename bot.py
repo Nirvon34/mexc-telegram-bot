@@ -18,7 +18,7 @@ from telegram import Bot
 from bus import emit  # emit(symbol, 'buy'|'sell', price=None, meta=None)
 
 # ── Флаг: слать стартовое сообщение один раз за процесс
-_START_MSG_SENT = False
+_START_MSG_SENT = 0
 
 # ── ENV
 load_dotenv(override=True)
