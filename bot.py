@@ -4,23 +4,27 @@
 
 import os
 import time
+import json
 import asyncio
+import threading
+import pathlib
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-import numpy as np
-import pandas as pd
 from dotenv import load_dotenv
 from telegram import Bot
 
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
 from bus import emit  # emit(symbol, 'buy'|'sell', price=None, meta=None)
 
-# ── Флаг: слать стартовое сообщение один раз за процесс
-_START_MSG_SENT = 0
-
-# ── ENV
+# ─────────────────────────── ENV ───────────────────────────
 load_dotenv(override=True)
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -57,7 +61,28 @@ try:
 except Exception:
     TZ_LOCAL = ZoneInfo("Europe/Belgrade")
 
-# ── HTTP session с ретраями (помогает от 403/429/5xx)
+# ── TTL на приветствие (чтобы не спамить при редких рестартах)
+STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/tmp/mexc_state.json"))
+STARTUP_MSG_TTL_MIN = int(os.getenv("STARTUP_MSG_TTL_MIN", "720"))  # 12 часов; <=0 — не слать вовсе
+
+def ok_to_send_startup() -> bool:
+    if STARTUP_MSG_TTL_MIN <= 0:
+        return False
+    try:
+        st = json.loads(STATE_FILE.read_text())
+        last = int(st.get("start_sent_ts", 0))
+    except Exception:
+        last = 0
+    now = int(time.time())
+    if now - last >= STARTUP_MSG_TTL_MIN * 60:
+        try:
+            STATE_FILE.write_text(json.dumps({"start_sent_ts": now}))
+        except Exception:
+            pass
+        return True
+    return False
+
+# ───────────────────── HTTP session (MEXC/Binance) ─────────────────────
 HEADERS = {
     "User-Agent": "mexc-telegram-bot/1.0 (+https://render.com)",
     "Accept": "application/json",
@@ -84,7 +109,7 @@ def make_session() -> requests.Session:
 
 SESSION_HTTP = make_session()
 
-# ── Telegram
+# ─────────────────────────── Telegram ───────────────────────────
 async def _send_async(text: str):
     if not TG_TOKEN or not TG_CHAT:
         print("⚠️ TELEGRAM_TOKEN/CHAT_ID не заданы. Сообщение:", text)
@@ -94,12 +119,13 @@ async def _send_async(text: str):
 
 def send_msg(text: str):
     try:
+        # На Linux это тихо проигнорируется
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
     asyncio.run(_send_async(text))
 
-# ── helpers
+# ─────────────────────────── helpers ───────────────────────────
 def drop_unclosed_last_bar(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -163,7 +189,7 @@ def interval_to_htf(interval: str) -> str:
     if i in ("2h","4h","6h","8h","12h","1d"): return "1w"
     return "1M"
 
-# ── KLINES с авто-фолбэком
+# ─────────────────────────── KLINES ───────────────────────────
 def _df_from_k(arr) -> pd.DataFrame:
     row_len = len(arr[0])
     if row_len >= 12: cols = ["t","o","h","l","c","v","t2","q","n","tb","tq","ig"]
@@ -239,7 +265,7 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"All klines sources failed: {e}")
 
-# ── Стратегия
+# ─────────────────────────── Стратегия ───────────────────────────
 def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, dict]:
     df = df_ltf.copy()
     df["ema50"]  = ema(df["c"], 50)
@@ -304,7 +330,7 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
     }
     return side, meta
 
-# ── Task
+# ─────────────────────────── Task ───────────────────────────
 class Task:
     def __init__(self, label: str, poll_delay: int, mexc_symbol: str, mexc_interval: str):
         self.label = label
@@ -370,8 +396,8 @@ class Task:
         except Exception as e:
             print(f"[{self.label}] Ошибка: {e}")
 
-def main():
-    global _START_MSG_SENT
+# ─────────────────────────── Воркер ───────────────────────────
+def run_worker():
     task = Task(
         label=f"{MEXC_SYMBOL} ({MEXC_INTERVAL})",
         poll_delay=POLL_DELAY,
@@ -380,17 +406,45 @@ def main():
     )
     print(f"Бот запущен. Источник: MEXC spot klines (c fallback). TZ: {TZ_NAME}")
 
-    # Отправить стартовое сообщение ровно один раз за процесс
-    if not _START_MSG_SENT:
+    # Отправить стартовое сообщение с TTL-защитой
+    if ok_to_send_startup():
         send_msg(
             f"🚀 Бот запущен. Источник: MEXC (fallback v2/Binance при 403)\n"
             f"Задача: {MEXC_SYMBOL} ({MEXC_INTERVAL})\nTZ: {TZ_NAME}"
         )
-        _START_MSG_SENT = True
 
     while True:
         task.tick()
         time.sleep(1)  # частый цикл; сам tick ограничен POLL_DELAY
 
+# ─────────────────────────── FastAPI (keep-alive) ───────────────────────────
+app = FastAPI()
+_worker_started = False
+_worker_lock = threading.Lock()
+
+def start_worker_once():
+    global _worker_started
+    with _worker_lock:
+        if _worker_started:
+            return
+        t = threading.Thread(target=run_worker, daemon=True)
+        t.start()
+        _worker_started = True
+
+@app.on_event("startup")
+def _startup():
+    start_worker_once()
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "mexc-telegram-bot", "symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL}
+
+@app.get("/health")
+def health():
+    # лёгкий обработчик для keep-alive пингов
+    return JSONResponse({"ok": True, "ts": int(time.time()), "tz": TZ_NAME})
+
+# ─────────────────────────── Script mode ───────────────────────────
 if __name__ == "__main__":
-    main()
+    # Локальный запуск как скрипта (без uvicorn)
+    run_worker()
