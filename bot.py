@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Regime Switcher (Donchian Trend Breakout + Range Reversion) → Telegram + emit в MT5
-# С авто-фолбэком источника свечей: MEXC v3 → MEXC v2 → Binance v3
+# Источник свечей: MEXC v3 → MEXC v2 → Binance v3 (fallback)
+# Запуск: uvicorn bot:app --host 0.0.0.0 --port $PORT
 
 import os
 import time
@@ -19,7 +20,7 @@ from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from telegram import Bot
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from bus import emit  # emit(symbol, 'buy'|'sell', price=None, meta=None)
@@ -61,9 +62,9 @@ try:
 except Exception:
     TZ_LOCAL = ZoneInfo("Europe/Belgrade")
 
-# ── TTL на приветствие (чтобы не спамить при редких рестартах)
+# TTL на приветствие (чтобы не спамить при редких рестартах)
 STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/tmp/mexc_state.json"))
-STARTUP_MSG_TTL_MIN = int(os.getenv("STARTUP_MSG_TTL_MIN", "720"))  # 12 часов; <=0 — не слать вовсе
+STARTUP_MSG_TTL_MIN = int(os.getenv("STARTUP_MSG_TTL_MIN", "720"))  # 12 часов; 0 — отключить «🚀»
 
 def ok_to_send_startup() -> bool:
     if STARTUP_MSG_TTL_MIN <= 0:
@@ -80,6 +81,22 @@ def ok_to_send_startup() -> bool:
         except Exception:
             pass
         return True
+    return False
+
+# Анти-дубль сигналов (персистентный снапшот «какую сторону на каком баре уже слали»)
+SIG_STATE = pathlib.Path(os.getenv("SIG_STATE_FILE", "/tmp/mexc_last_signal.json"))
+
+def _already_sent(side: str, bar_ts: pd.Timestamp) -> bool:
+    try:
+        st = json.loads(SIG_STATE.read_text())
+        if st.get("side") == side and st.get("bar") == bar_ts.isoformat():
+            return True
+    except Exception:
+        pass
+    try:
+        SIG_STATE.write_text(json.dumps({"side": side, "bar": bar_ts.isoformat()}))
+    except Exception:
+        pass
     return False
 
 # ───────────────────── HTTP session (MEXC/Binance) ─────────────────────
@@ -119,7 +136,7 @@ async def _send_async(text: str):
 
 def send_msg(text: str):
     try:
-        # На Linux это тихо проигнорируется
+        # На Linux тихо проигнорируется
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
@@ -189,6 +206,17 @@ def interval_to_htf(interval: str) -> str:
     if i in ("2h","4h","6h","8h","12h","1d"): return "1w"
     return "1M"
 
+def _fmt_signal_text(side: str, meta: dict, bar_ts: pd.Timestamp) -> str:
+    head = "🟢 BUY" if side == "buy" else "🔴 SELL"
+    p    = float(meta["price"])
+    when = fmt_time_local(bar_ts)
+    return (
+        f"{head}  #{meta['symbol']} ({meta['interval']}) | {when}\n"
+        f"price={p:.5f}  adx={meta['adx']:.1f}  atr%={meta['atr_pc']:.2f}%  regime={meta['regime']}\n"
+        f"HTF: up={meta['htf_up']} dn={meta['htf_dn']}  "
+        f"Donchian: H={meta['don_hi_prev']:.5f}  L={meta['don_lo_prev']:.5f}"
+    )
+
 # ─────────────────────────── KLINES ───────────────────────────
 def _df_from_k(arr) -> pd.DataFrame:
     row_len = len(arr[0])
@@ -238,9 +266,8 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
             js = r2.json()
             arr = js.get("data", [])
             if arr:
-                # v2: t(sec), o,h,l,c,v
-                data = [[int(a["t"])*1000, float(a["o"]), float(a["h"]), float(a["l"]), float(a["c"]), float(a["v"]), 0, 0]
-                        for a in arr]
+                data = [[int(a["t"])*1000, float(a["o"]), float(a["h"]), float(a["l"]),
+                         float(a["c"]), float(a["v"]), 0, 0] for a in arr]
                 print("[klines] MEXC v2")
                 return _df_from_k(data)
         raise RuntimeError(f"mexc v2 status {r2.status_code}")
@@ -258,7 +285,6 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
         arr = r3.json()
         if not arr:
             raise RuntimeError("binance empty")
-        # binance: [open_time, open, high, low, close, volume, close_time, ...]
         data = [[a[0], a[1], a[2], a[3], a[4], a[5], a[6], 0] for a in arr]
         print("[klines] Binance v3")
         return _df_from_k(data)
@@ -379,15 +405,15 @@ class Task:
             price = float(meta.get("price", float(df["c"].iloc[-1])))
 
             if side and self._ok_limits(len(df)) and in_session(datetime.now(timezone.utc)):
-                when_local = fmt_time_local(lt)
-                msg = (f"#{EMIT_SYMBOL} {side.upper()} | {when_local}\n"
-                       f"price={price:.5f}  adx={meta['adx']:.1f}  atr%={meta['atr_pc']:.2f}%  regime={meta['regime']}\n"
-                       f"HTF trend: up={meta['htf_up']} dn={meta['htf_dn']}  "
-                       f"Donchian prev: H={meta['don_hi_prev']:.5f} L={meta['don_lo_prev']:.5f}")
-                print(msg); send_msg(msg)
-                self._emit_trade(side, price, meta)
-                self.last_trade_index = len(df)
-                self.trades_today += 1
+                if not _already_sent(side, lt):
+                    text = _fmt_signal_text(side, meta, lt)
+                    print(text)
+                    send_msg(text)                 # ← телеграм-уведомление
+                    self._emit_trade(side, price, meta)
+                    self.last_trade_index = len(df)
+                    self.trades_today += 1
+                else:
+                    print(f"[{self.label}] duplicate signal skipped | {side} @ {lt}")
             else:
                 print(f"[{self.label}] no signal | bar {lt}")
 
@@ -405,14 +431,11 @@ def run_worker():
         mexc_interval=MEXC_INTERVAL,
     )
     print(f"Бот запущен. Источник: MEXC spot klines (c fallback). TZ: {TZ_NAME}")
-
-    # Отправить стартовое сообщение с TTL-защитой
     if ok_to_send_startup():
         send_msg(
             f"🚀 Бот запущен. Источник: MEXC (fallback v2/Binance при 403)\n"
             f"Задача: {MEXC_SYMBOL} ({MEXC_INTERVAL})\nTZ: {TZ_NAME}"
         )
-
     while True:
         task.tick()
         time.sleep(1)  # частый цикл; сам tick ограничен POLL_DELAY
@@ -441,8 +464,21 @@ def root():
 
 @app.get("/health")
 def health():
-    # лёгкий обработчик для keep-alive пингов
     return JSONResponse({"ok": True, "ts": int(time.time()), "tz": TZ_NAME})
+
+# Тест ручка: шлёт в Telegram фиктивный BUY (можно удалить)
+@app.get("/test_sig")
+def test_sig():
+    dummy = {
+        "symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL, "price": 123.45678,
+        "adx": 25.0, "atr_pc": 1.23, "regime": "trend",
+        "htf_up": True, "htf_dn": False,
+        "don_hi_prev": 1.0, "don_lo_prev": 0.9
+    }
+    now_bar = pd.Timestamp.utcnow().tz_localize("UTC")
+    text = _fmt_signal_text("buy", dummy, now_bar)
+    send_msg(text)
+    return {"ok": True}
 
 # ─────────────────────────── Script mode ───────────────────────────
 if __name__ == "__main__":
