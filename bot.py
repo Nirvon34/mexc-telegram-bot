@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # Regime Switcher (Donchian Trend Breakout + Range Reversion) → Telegram (messages only)
 # Источник свечей: MEXC v3 → MEXC v2 → Binance v3 (fallback)
-# Запуск локально:    python bot.py
-# Запуск как веб:     uvicorn bot:app --host 0.0.0.0 --port $PORT
+# Локально: python bot.py
+# Веб:     uvicorn bot:app --host 0.0.0.0 --port $PORT
 
 import os
 import time
@@ -10,6 +10,7 @@ import json
 import asyncio
 import threading
 import pathlib
+import tempfile
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -33,15 +34,15 @@ MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
 MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "15m").strip()   # дефолт 15 минут
 
 # Параметры стратегии
-CHLEN       = int(os.getenv("CHLEN", "40"))        # период Дончиана
+CHLEN       = int(os.getenv("CHLEN", "40"))
 ADX_LEN     = int(os.getenv("ADX_LEN", "14"))
 ADX_MIN     = float(os.getenv("ADX_MIN", "24"))
 ATR_LEN     = int(os.getenv("ATR_LEN", "14"))
 ATR_MIN_PC  = float(os.getenv("ATR_MIN_PC", "0.018"))   # 1.8% от цены
-BUF_ATR     = float(os.getenv("BUF_ATR", "0.20"))       # буфер пробоя в ATR
-DIST_SLOW   = float(os.getenv("DIST_SLOW", "0.6"))      # мин. дистанция от EMA200 в ATR
+BUF_ATR     = float(os.getenv("BUF_ATR", "0.20"))
+DIST_SLOW   = float(os.getenv("DIST_SLOW", "0.6"))
 
-# Mean-reversion, когда тренда по ADX нет
+# Mean-reversion при слабом тренде
 USE_MR   = os.getenv("USE_MR", "1").strip() != "0"
 DEV_ATR  = float(os.getenv("DEV_ATR", "1.2"))
 RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
@@ -51,7 +52,7 @@ RSI_HIGH = float(os.getenv("RSI_HIGH", "65"))
 # Сессия/лимиты (антиспам сообщений)
 SESSION        = os.getenv("SESSION", "0700-1800").strip()
 COOLDOWN_BARS  = int(os.getenv("COOLDOWN_BARS", "40"))
-MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "2"))   # лимит сообщений в день
+MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "2"))
 
 POLL_DELAY = int(os.getenv("POLL_DELAY", "60"))
 TZ_NAME    = os.getenv("TZ", "Europe/Belgrade").strip()
@@ -60,38 +61,26 @@ try:
 except Exception:
     TZ_LOCAL = ZoneInfo("Europe/Belgrade")
 
-# ─────────────────────────── Персистентные файлы ───────────────────────────
-# По умолчанию храним состояние в устойчивой папке (Windows → C:\tv2mt5\state, Linux → /data)
+# ─────────────────────── Файлы состояния (только для антидубля сигналов) ───────────────────────
+def _ensure_dir(p: pathlib.Path) -> pathlib.Path:
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        (p / ".wtest").write_text("ok", encoding="utf-8")
+        (p / ".wtest").unlink()
+        return p
+    except Exception:
+        tmp = pathlib.Path(tempfile.gettempdir()) / "mexc_state"
+        tmp.mkdir(parents=True, exist_ok=True)
+        return tmp
+
 DEFAULT_STATE_DIR = r"C:\tv2mt5\state" if os.name == "nt" else "/data"
 STATE_DIR = pathlib.Path(os.getenv("STATE_DIR", DEFAULT_STATE_DIR))
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR = _ensure_dir(STATE_DIR)
 
-# TTL на приветствие (чтобы не спамить при рестартах). 0 = ПОЛНОСТЬЮ выключено.
-STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", str(STATE_DIR / "mexc_state.json")))
-STARTUP_MSG_TTL_MIN = int(os.getenv("STARTUP_MSG_TTL_MIN", "0"))  # 0 — не слать «🚀»
-
-# Анти-дубль сигналов (персистентный снапшот «какую сторону на каком баре уже слали»)
 SIG_STATE = pathlib.Path(os.getenv("SIG_STATE_FILE", str(STATE_DIR / "mexc_last_signal.json")))
 
-def ok_to_send_startup() -> bool:
-    if STARTUP_MSG_TTL_MIN <= 0:
-        return False
-    try:
-        st = json.loads(STATE_FILE.read_text())
-        last = int(st.get("start_sent_ts", 0))
-    except Exception:
-        last = 0
-    now = int(time.time())
-    if now - last >= STARTUP_MSG_TTL_MIN * 60:
-        try:
-            STATE_FILE.write_text(json.dumps({"start_sent_ts": now}))
-        except Exception:
-            pass
-        return True
-    return False
-
 def _already_sent(side: str, bar_ts: pd.Timestamp) -> bool:
-    """Возвращает True, если такой же сигнал уже отправляли на этом баре (переживает рестарты)."""
+    """True если такой же сигнал уже слали на этом баре (переживает рестарты)."""
     try:
         st = json.loads(SIG_STATE.read_text())
         if (
@@ -151,7 +140,6 @@ async def _send_async(text: str):
 
 def send_msg(text: str):
     try:
-        # На Windows требуется WindowsSelectorEventLoopPolicy
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
@@ -159,15 +147,10 @@ def send_msg(text: str):
 
 # ─────────────────────────── helpers ───────────────────────────
 def drop_unclosed_last_bar(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    return df.iloc[:-1] if len(df) >= 1 else df
+    return df.iloc[:-1] if df is not None and len(df) >= 1 else df
 
 def fmt_time_local(ts_utc: datetime | pd.Timestamp) -> str:
-    if isinstance(ts_utc, pd.Timestamp):
-        dt = ts_utc.to_pydatetime().replace(tzinfo=timezone.utc)
-    else:
-        dt = ts_utc.replace(tzinfo=timezone.utc)
+    dt = ts_utc.to_pydatetime().replace(tzinfo=timezone.utc) if isinstance(ts_utc, pd.Timestamp) else ts_utc.replace(tzinfo=timezone.utc)
     return dt.astimezone(TZ_LOCAL).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def in_session(now: datetime) -> bool:
@@ -282,7 +265,7 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
             "1h":"Hour1","2h":"Hour2","4h":"Hour4","6h":"Hour6","8h":"Hour8","12h":"Hour12",
             "1d":"Day1","1w":"Week1","1M":"Month1"
         }
-        i_v2 = i_map.get(interval.lower(), "Min15")   # ← дефолтно берём 15m, а не 5m
+        i_v2 = i_map.get(interval.lower(), "Min15")   # дефолтно 15m
         r2 = SESSION_HTTP.get(url_v2, params={"symbol": sym_v2, "interval": i_v2, "limit": limit}, timeout=20)
         if r2.status_code == 200:
             js = r2.json()
@@ -425,7 +408,7 @@ class Task:
                 if not _already_sent(side, lt):
                     text = _fmt_signal_text(side, meta, lt)
                     print(text)
-                    send_msg(text)                 # ← только телеграм-уведомление
+                    send_msg(text)
                     self.last_msg_index = len(df)
                     self.msgs_today += 1
                 else:
@@ -447,14 +430,10 @@ def run_worker():
         mexc_interval=MEXC_INTERVAL,
     )
     print(f"Бот запущен. Источник: MEXC spot klines (с fallback). TZ: {TZ_NAME}")
-    if ok_to_send_startup():
-        send_msg(
-            f"🚀 Бот запущен. Источник: MEXC (fallback v2/Binance при 403)\n"
-            f"Задача: {MEXC_SYMBOL} ({MEXC_INTERVAL})\nTZ: {TZ_NAME}"
-        )
+    # Стартового сообщения в Telegram НЕТ — убрано намеренно.
     while True:
         task.tick()
-        time.sleep(1)  # частый цикл; сам tick ограничен POLL_DELAY
+        time.sleep(1)
 
 # ─────────────────────────── FastAPI (keep-alive) ───────────────────────────
 app = FastAPI()
@@ -498,6 +477,5 @@ def test_sig():
 
 # ─────────────────────────── Script mode ───────────────────────────
 if __name__ == "__main__":
-    # Локальный запуск как скрипта (без uvicorn)
     run_worker()
 
