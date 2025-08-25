@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # Regime Switcher (Donchian Trend Breakout + Range Reversion) → Telegram (messages only)
 # Источник свечей: MEXC v3 → MEXC v2 → Binance v3 (fallback)
-# Запуск: uvicorn bot:app --host 0.0.0.0 --port $PORT
+# Запуск локально:    python bot.py
+# Запуск как веб:     uvicorn bot:app --host 0.0.0.0 --port $PORT
 
 import os
 import time
@@ -29,10 +30,10 @@ TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
-MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "15m").strip()   # ← 15 минут по умолчанию
+MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "15m").strip()   # дефолт 15 минут
 
 # Параметры стратегии
-CHLEN       = int(os.getenv("CHLEN", "40"))          # период Дончиана
+CHLEN       = int(os.getenv("CHLEN", "40"))        # период Дончиана
 ADX_LEN     = int(os.getenv("ADX_LEN", "14"))
 ADX_MIN     = float(os.getenv("ADX_MIN", "24"))
 ATR_LEN     = int(os.getenv("ATR_LEN", "14"))
@@ -47,7 +48,7 @@ RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
 RSI_LOW  = float(os.getenv("RSI_LOW", "35"))
 RSI_HIGH = float(os.getenv("RSI_HIGH", "65"))
 
-# Сессия/лимиты (работают как антиспам для сообщений)
+# Сессия/лимиты (антиспам сообщений)
 SESSION        = os.getenv("SESSION", "0700-1800").strip()
 COOLDOWN_BARS  = int(os.getenv("COOLDOWN_BARS", "40"))
 MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "2"))   # лимит сообщений в день
@@ -59,9 +60,18 @@ try:
 except Exception:
     TZ_LOCAL = ZoneInfo("Europe/Belgrade")
 
-# TTL на приветствие (чтобы не спамить при редких рестартах)
-STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/tmp/mexc_state.json"))
-STARTUP_MSG_TTL_MIN = int(os.getenv("STARTUP_MSG_TTL_MIN", "720"))  #0; 0 — отключить «🚀»
+# ─────────────────────────── Персистентные файлы ───────────────────────────
+# По умолчанию храним состояние в устойчивой папке (Windows → C:\tv2mt5\state, Linux → /data)
+DEFAULT_STATE_DIR = r"C:\tv2mt5\state" if os.name == "nt" else "/data"
+STATE_DIR = pathlib.Path(os.getenv("STATE_DIR", DEFAULT_STATE_DIR))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+# TTL на приветствие (чтобы не спамить при рестартах). 0 = ПОЛНОСТЬЮ выключено.
+STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", str(STATE_DIR / "mexc_state.json")))
+STARTUP_MSG_TTL_MIN = int(os.getenv("STARTUP_MSG_TTL_MIN", "0"))  # 0 — не слать «🚀»
+
+# Анти-дубль сигналов (персистентный снапшот «какую сторону на каком баре уже слали»)
+SIG_STATE = pathlib.Path(os.getenv("SIG_STATE_FILE", str(STATE_DIR / "mexc_last_signal.json")))
 
 def ok_to_send_startup() -> bool:
     if STARTUP_MSG_TTL_MIN <= 0:
@@ -80,18 +90,26 @@ def ok_to_send_startup() -> bool:
         return True
     return False
 
-# Анти-дубль сигналов (персистентный снапшот «какую сторону на каком баре уже слали»)
-SIG_STATE = pathlib.Path(os.getenv("SIG_STATE_FILE", "/tmp/mexc_last_signal.json"))
-
 def _already_sent(side: str, bar_ts: pd.Timestamp) -> bool:
+    """Возвращает True, если такой же сигнал уже отправляли на этом баре (переживает рестарты)."""
     try:
         st = json.loads(SIG_STATE.read_text())
-        if st.get("side") == side and st.get("bar") == bar_ts.isoformat():
+        if (
+            st.get("side") == side
+            and st.get("bar") == bar_ts.isoformat()
+            and st.get("symbol") == MEXC_SYMBOL
+            and st.get("interval") == MEXC_INTERVAL
+        ):
             return True
     except Exception:
         pass
     try:
-        SIG_STATE.write_text(json.dumps({"side": side, "bar": bar_ts.isoformat()}))
+        SIG_STATE.write_text(json.dumps({
+            "side": side,
+            "bar": bar_ts.isoformat(),
+            "symbol": MEXC_SYMBOL,
+            "interval": MEXC_INTERVAL,
+        }))
     except Exception:
         pass
     return False
@@ -133,7 +151,7 @@ async def _send_async(text: str):
 
 def send_msg(text: str):
     try:
-        # На Windows нужна политика, на Linux тихо проигнорируется
+        # На Windows требуется WindowsSelectorEventLoopPolicy
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
@@ -196,8 +214,13 @@ def adx_df(df: pd.DataFrame, length: int) -> pd.Series:
     dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0.0, np.nan)
     return rma(dx.fillna(0.0), length)
 
+def normalize_interval(interval: str) -> str:
+    valid = {"1m","3m","5m","15m","20m","30m","1h","2h","4h","6h","8h","12h","1d","1w","1M"}
+    i = (interval or "").strip()
+    return i if i in valid else "15m"
+
 def interval_to_htf(interval: str) -> str:
-    i = interval.lower()
+    i = normalize_interval(interval).lower()
     if i in ("1m","3m","5m","15m"): return "4h"
     if i in ("20m","30m","1h"):     return "1d"
     if i in ("2h","4h","6h","8h","12h","1d"): return "1w"
@@ -232,6 +255,8 @@ def _df_from_k(arr) -> pd.DataFrame:
     return df
 
 def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
+    interval = normalize_interval(interval)
+
     # 1) MEXC v3
     try:
         r = SESSION_HTTP.get(
@@ -257,7 +282,7 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
             "1h":"Hour1","2h":"Hour2","4h":"Hour4","6h":"Hour6","8h":"Hour8","12h":"Hour12",
             "1d":"Day1","1w":"Week1","1M":"Month1"
         }
-        i_v2 = i_map.get(interval.lower(), "Min5")
+        i_v2 = i_map.get(interval.lower(), "Min15")   # ← дефолтно берём 15m, а не 5m
         r2 = SESSION_HTTP.get(url_v2, params={"symbol": sym_v2, "interval": i_v2, "limit": limit}, timeout=20)
         if r2.status_code == 200:
             js = r2.json()
@@ -421,7 +446,7 @@ def run_worker():
         mexc_symbol=MEXC_SYMBOL,
         mexc_interval=MEXC_INTERVAL,
     )
-    print(f"Бот запущен. Источник: MEXC spot klines (c fallback). TZ: {TZ_NAME}")
+    print(f"Бот запущен. Источник: MEXC spot klines (с fallback). TZ: {TZ_NAME}")
     if ok_to_send_startup():
         send_msg(
             f"🚀 Бот запущен. Источник: MEXC (fallback v2/Binance при 403)\n"
@@ -457,7 +482,7 @@ def root():
 def health():
     return JSONResponse({"ok": True, "ts": int(time.time()), "tz": TZ_NAME})
 
-# Тест ручка: шлёт в Telegram фиктивный BUY (можно удалить)
+# Тест-ручка: шлёт в Telegram фиктивный BUY
 @app.get("/test_sig")
 def test_sig():
     dummy = {
@@ -475,3 +500,4 @@ def test_sig():
 if __name__ == "__main__":
     # Локальный запуск как скрипта (без uvicorn)
     run_worker()
+
