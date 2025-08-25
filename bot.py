@@ -61,7 +61,7 @@ except Exception:
 
 # TTL на приветствие (чтобы не спамить при редких рестартах)
 STATE_FILE = pathlib.Path(os.getenv("STATE_FILE", "/tmp/mexc_state.json"))
-STARTUP_MSG_TTL_MIN = int(os.getenv("STARTUP_MSG_TTL_MIN", "720"))  # 12 часов; 0 — отключить «🚀»
+STARTUP_MSG_TTL_MIN = int(os.getenv("STARTUP_MSG_TTL_MIN", "720"))  #0; 0 — отключить «🚀»
 
 def ok_to_send_startup() -> bool:
     if STARTUP_MSG_TTL_MIN <= 0:
