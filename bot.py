@@ -31,7 +31,7 @@ TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
-MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "1m").strip()
+MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "5m").strip()
 EMIT_SYMBOL   = os.getenv("EMIT_SYMBOL", "EURUSD").strip()  # что будет торговать MT5
 
 # Параметры стратегии (под M5)
