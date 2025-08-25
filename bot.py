@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Regime Switcher (Donchian Trend Breakout + Range Reversion) → Telegram + emit в MT5
+# Regime Switcher (Donchian Trend Breakout + Range Reversion) → Telegram (messages only)
 # Источник свечей: MEXC v3 → MEXC v2 → Binance v3 (fallback)
 # Запуск: uvicorn bot:app --host 0.0.0.0 --port $PORT
 
@@ -20,10 +20,8 @@ from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from telegram import Bot
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-
-from bus import emit  # emit(symbol, 'buy'|'sell', price=None, meta=None)
 
 # ─────────────────────────── ENV ───────────────────────────
 load_dotenv(override=True)
@@ -31,17 +29,16 @@ TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
-MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "5m").strip()
-EMIT_SYMBOL   = os.getenv("EMIT_SYMBOL", "EURUSD").strip()  # что будет торговать MT5
+MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "15m").strip()   # ← 15 минут по умолчанию
 
-# Параметры стратегии (под M5)
+# Параметры стратегии
 CHLEN       = int(os.getenv("CHLEN", "40"))          # период Дончиана
 ADX_LEN     = int(os.getenv("ADX_LEN", "14"))
 ADX_MIN     = float(os.getenv("ADX_MIN", "24"))
 ATR_LEN     = int(os.getenv("ATR_LEN", "14"))
 ATR_MIN_PC  = float(os.getenv("ATR_MIN_PC", "0.018"))   # 1.8% от цены
-BUF_ATR     = float(os.getenv("BUF_ATR", "0.20"))        # буфер пробоя в ATR
-DIST_SLOW   = float(os.getenv("DIST_SLOW", "0.6"))       # мин. дистанция от EMA200 в ATR
+BUF_ATR     = float(os.getenv("BUF_ATR", "0.20"))       # буфер пробоя в ATR
+DIST_SLOW   = float(os.getenv("DIST_SLOW", "0.6"))      # мин. дистанция от EMA200 в ATR
 
 # Mean-reversion, когда тренда по ADX нет
 USE_MR   = os.getenv("USE_MR", "1").strip() != "0"
@@ -50,10 +47,10 @@ RSI_LEN  = int(os.getenv("RSI_LEN", "14"))
 RSI_LOW  = float(os.getenv("RSI_LOW", "35"))
 RSI_HIGH = float(os.getenv("RSI_HIGH", "65"))
 
-# Сессия/лимиты
+# Сессия/лимиты (работают как антиспам для сообщений)
 SESSION        = os.getenv("SESSION", "0700-1800").strip()
 COOLDOWN_BARS  = int(os.getenv("COOLDOWN_BARS", "40"))
-MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "2"))
+MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "2"))   # лимит сообщений в день
 
 POLL_DELAY = int(os.getenv("POLL_DELAY", "60"))
 TZ_NAME    = os.getenv("TZ", "Europe/Belgrade").strip()
@@ -136,7 +133,7 @@ async def _send_async(text: str):
 
 def send_msg(text: str):
     try:
-        # На Linux тихо проигнорируется
+        # На Windows нужна политика, на Linux тихо проигнорируется
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
@@ -365,25 +362,21 @@ class Task:
         self.mexc_interval = mexc_interval
         self.last_bar_time = None
         self.last_tick_ts = 0.0
-        self.last_trade_index: int | None = None
-        self.trades_today = 0
+        self.last_msg_index: int | None = None
+        self.msgs_today = 0
         self.cur_day = None
-
-    def _emit_trade(self, side: str, price: float | None, meta: dict):
-        ev = emit(EMIT_SYMBOL, side, price=price, meta={"src": "mexc_regime", **meta})
-        print(f"EMIT ▶ {EMIT_SYMBOL} → {side} @ {price} | {ev}")
 
     def _ok_limits(self, df_len: int) -> bool:
         now_local = datetime.now(tz=TZ_LOCAL)
         d = (now_local.year, now_local.month, now_local.day)
         if self.cur_day != d:
             self.cur_day = d
-            self.trades_today = 0
-        if self.trades_today >= MAX_TRADES_DAY:
+            self.msgs_today = 0
+        if self.msgs_today >= MAX_TRADES_DAY:
             return False
-        if self.last_trade_index is None:
+        if self.last_msg_index is None:
             return True
-        return (df_len - self.last_trade_index) >= COOLDOWN_BARS
+        return (df_len - self.last_msg_index) >= COOLDOWN_BARS
 
     def tick(self):
         now = time.time()
@@ -402,16 +395,14 @@ class Task:
             df_htf = load_klines(self.mexc_symbol, htf)
 
             side, meta = make_signal(df, df_htf)
-            price = float(meta.get("price", float(df["c"].iloc[-1])))
 
             if side and self._ok_limits(len(df)) and in_session(datetime.now(timezone.utc)):
                 if not _already_sent(side, lt):
                     text = _fmt_signal_text(side, meta, lt)
                     print(text)
-                    send_msg(text)                 # ← телеграм-уведомление
-                    self._emit_trade(side, price, meta)
-                    self.last_trade_index = len(df)
-                    self.trades_today += 1
+                    send_msg(text)                 # ← только телеграм-уведомление
+                    self.last_msg_index = len(df)
+                    self.msgs_today += 1
                 else:
                     print(f"[{self.label}] duplicate signal skipped | {side} @ {lt}")
             else:
