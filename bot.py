@@ -525,4 +525,37 @@ class Task:
 
 # ─────────────────────────── Воркер ───────────────────────────
 def run_worker():
-    task
+    task = Task("mexc", POLL_DELAY, MEXC_SYMBOL, MEXC_INTERVAL)
+    while True:
+        try:
+            task.tick()
+        except Exception as e:
+            print(f"[worker] error: {e}")
+        time.sleep(1)
+
+# ─────────────────────────── ASGI (FastAPI) ───────────────────────────
+app = FastAPI()
+
+@app.get("/")
+def index():
+    return {
+        "ok": True,
+        "service": "mexc-telegram-bot",
+        "symbol": MEXC_SYMBOL,
+        "interval": MEXC_INTERVAL,
+        "time": datetime.now(tz=TZ_LOCAL).isoformat(),
+    }
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.on_event("startup")
+def _startup():
+    t = threading.Thread(target=run_worker, daemon=True)
+    t.start()
+    print("✅ background worker started")
+
+if __name__ == "__main__":  # локальный запуск: python bot.py
+    print("▶ running locally (no web server)")
+    run_worker()
