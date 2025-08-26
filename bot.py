@@ -327,7 +327,7 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"All klines sources failed: {e}")
 
-# ─────────────────────────── Стратегия ───────────────────────────
+# ─────────────────────────── Стратегия (исправленная логика) ───────────────────────────
 def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, dict]:
     df = df_ltf.copy()
     df["ema50"]  = ema(df["c"], 50)
@@ -360,24 +360,51 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
     long_break  = c > (don_hi_prev + BUF_ATR * atr)
     short_break = c < (don_lo_prev - BUF_ATR * atr)
 
+    # Основные условия для трендовых сигналов
     go_long  = htf_up and trend_up and atr_ok and adx_ok and far_slow and long_break
     go_short = htf_dn and trend_dn and atr_ok and adx_ok and far_slow and short_break
 
     side = None
     regime = "trend"
+    
+    # ИСПРАВЛЕННАЯ ЛОГИКА: четкие приоритеты
     if go_long and not go_short:
         side = "buy"
+        print(f"🔍 TREND BUY: htf_up={htf_up}, trend_up={trend_up}, adx={adx:.1f}>={ADX_MIN}, long_break={long_break}")
     elif go_short and not go_long:
-        side = "sell"
-    elif USE_MR and not adx_ok:
+        side = "sell" 
+        print(f"🔍 TREND SELL: htf_dn={htf_dn}, trend_dn={trend_dn}, adx={adx:.1f}>={ADX_MIN}, short_break={short_break}")
+    elif USE_MR and not adx_ok:  # Mean reversion только при слабом тренде
         regime = "range"
         dev = DEV_ATR * atr
         long_mr  = (c < ema50 - dev) and (rsi_v < RSI_LOW)
         short_mr = (c > ema50 + dev) and (rsi_v > RSI_HIGH)
+        
         if long_mr and not short_mr:
             side = "buy"
+            print(f"🔍 RANGE BUY: c={c:.5f} < ema50-dev={ema50-dev:.5f}, rsi={rsi_v:.1f} < {RSI_LOW}")
         elif short_mr and not long_mr:
             side = "sell"
+            print(f"🔍 RANGE SELL: c={c:.5f} > ema50+dev={ema50+dev:.5f}, rsi={rsi_v:.1f} > {RSI_HIGH}")
+        else:
+            print(f"🔍 RANGE: no signal (c={c:.5f}, ema50={ema50:.5f}, dev={dev:.5f}, rsi={rsi_v:.1f})")
+    else:
+        # Детальная диагностика почему нет сигнала
+        reasons = []
+        if not htf_up and not htf_dn: reasons.append("htf_neutral")
+        if not trend_up and not trend_dn: reasons.append("ltf_neutral") 
+        if not atr_ok: reasons.append(f"atr_low({atr/c*100:.2f}%<{ATR_MIN_PC*100}%)")
+        if not adx_ok: reasons.append(f"adx_low({adx:.1f}<{ADX_MIN})")
+        if not far_slow: reasons.append("close_to_ema200")
+        if not long_break and not short_break: reasons.append("no_donchian_break")
+        
+        print(f"🔍 NO SIGNAL: {', '.join(reasons) if reasons else 'unknown'}")
+
+    # Дополнительная диагностика
+    print(f"📊 Values: c={c:.5f}, ema50={ema50:.5f}, ema200={ema200:.5f}")
+    print(f"📊 Donchian: H={don_hi_prev:.5f} (break={don_hi_prev + BUF_ATR * atr:.5f})")
+    print(f"📊 Donchian: L={don_lo_prev:.5f} (break={don_lo_prev - BUF_ATR * atr:.5f})")
+    print(f"📊 HTF: up={htf_up}, dn={htf_dn} | LTF: up={trend_up}, dn={trend_dn}")
 
     meta = {
         "symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL, "price": float(c),
@@ -388,6 +415,7 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
         "trend_up": bool(trend_up), "trend_dn": bool(trend_dn),
         "atr_ok": bool(atr_ok), "adx_ok": bool(adx_ok), "far_slow": bool(far_slow),
         "don_hi_prev": float(don_hi_prev), "don_lo_prev": float(don_lo_prev),
+        "long_break": bool(long_break), "short_break": bool(short_break),
         "regime": regime,
     }
     return side, meta
@@ -497,60 +525,4 @@ class Task:
 
 # ─────────────────────────── Воркер ───────────────────────────
 def run_worker():
-    task = Task(
-        label=f"{MEXC_SYMBOL} ({MEXC_INTERVAL})",
-        poll_delay=POLL_DELAY,
-        mexc_symbol=MEXC_SYMBOL,
-        mexc_interval=MEXC_INTERVAL,
-    )
-    print(f"🚀 Bot started. Source: MEXC spot klines (with fallback). TZ: {TZ_NAME}")
-    print(f"📊 Settings: Symbol={MEXC_SYMBOL}, Interval={MEXC_INTERVAL}, Max daily trades={MAX_TRADES_DAY}")
-    print(f"⏰ Session time: {SESSION}, Cooldown: {COOLDOWN_BARS} bars")
-    
-    while True:
-        task.tick()
-        time.sleep(1)
-
-# ─────────────────────────── FastAPI (keep-alive) ───────────────────────────
-app = FastAPI()
-_worker_started = False
-_worker_lock = threading.Lock()
-
-def start_worker_once():
-    global _worker_started
-    with _worker_lock:
-        if _worker_started:
-            return
-        t = threading.Thread(target=run_worker, daemon=True)
-        t.start()
-        _worker_started = True
-
-@app.on_event("startup")
-def _startup():
-    start_worker_once()
-
-@app.get("/")
-def root():
-    return {"ok": True, "service": "mexc-telegram-bot", "symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL}
-
-@app.get("/health")
-def health():
-    return JSONResponse({"ok": True, "ts": int(time.time()), "tz": TZ_NAME})
-
-@app.get("/state")
-def get_state():
-    """Новая ручка для проверки состояния"""
-    try:
-        if SIG_STATE.exists():
-            state = json.loads(SIG_STATE.read_text())
-        else:
-            state = {"status": "no_state_file"}
-        return JSONResponse(state)
-    except Exception as e:
-        return JSONResponse({"error": str(e)})
-
-# Тест-ручка: шлёт в Telegram фиктивный BUY
-@app.get("/test_sig")
-def test_sig():
-    dummy = {
-        "symbol": MEXC_SYMBOL
+    task
