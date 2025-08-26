@@ -61,7 +61,7 @@ try:
 except Exception:
     TZ_LOCAL = ZoneInfo("Europe/Belgrade")
 
-# ─────────────────────── Файлы состояния (только для антидубля сигналов) ───────────────────────
+# ─────────────────────── Файлы состояния (улучшенная защита от дублей) ───────────────────────
 def _ensure_dir(p: pathlib.Path) -> pathlib.Path:
     try:
         p.mkdir(parents=True, exist_ok=True)
@@ -79,28 +79,53 @@ STATE_DIR = _ensure_dir(STATE_DIR)
 
 SIG_STATE = pathlib.Path(os.getenv("SIG_STATE_FILE", str(STATE_DIR / "mexc_last_signal.json")))
 
-def _already_sent(side: str, bar_ts: pd.Timestamp) -> bool:
-    """True если такой же сигнал уже слали на этом баре (переживает рестарты)."""
+def _already_sent(side: str, bar_ts: pd.Timestamp, price: float) -> bool:
+    """
+    Улучшенная защита от дублей: проверяем side, время бара, цену и добавляем минимальный интервал
+    """
     try:
-        st = json.loads(SIG_STATE.read_text())
-        if (
-            st.get("side") == side
-            and st.get("bar") == bar_ts.isoformat()
-            and st.get("symbol") == MEXC_SYMBOL
-            and st.get("interval") == MEXC_INTERVAL
-        ):
-            return True
-    except Exception:
-        pass
+        if SIG_STATE.exists():
+            st = json.loads(SIG_STATE.read_text())
+            
+            # Строгая проверка всех параметров
+            if (
+                st.get("side") == side
+                and st.get("bar") == bar_ts.isoformat()
+                and st.get("symbol") == MEXC_SYMBOL
+                and st.get("interval") == MEXC_INTERVAL
+                and abs(st.get("price", 0) - price) < 0.00001  # Проверка цены с точностью
+            ):
+                print(f"🚫 Duplicate signal blocked: {side} at {bar_ts} price={price}")
+                return True
+                
+            # Дополнительная защита: минимум 1 минута между одинаковыми сигналами
+            last_time = st.get("timestamp", 0)
+            if (
+                st.get("side") == side 
+                and time.time() - last_time < 60  # минимум 60 секунд между сигналами
+                and st.get("symbol") == MEXC_SYMBOL
+            ):
+                print(f"⏰ Signal too frequent: {side} (last: {last_time})")
+                return True
+                
+    except Exception as e:
+        print(f"Warning: state file read error: {e}")
+    
+    # Записываем новое состояние
     try:
-        SIG_STATE.write_text(json.dumps({
+        new_state = {
             "side": side,
             "bar": bar_ts.isoformat(),
             "symbol": MEXC_SYMBOL,
             "interval": MEXC_INTERVAL,
-        }))
-    except Exception:
-        pass
+            "price": price,
+            "timestamp": time.time()
+        }
+        SIG_STATE.write_text(json.dumps(new_state, indent=2))
+        print(f"✅ New signal state saved: {side} at {bar_ts}")
+    except Exception as e:
+        print(f"Warning: state file write error: {e}")
+        
     return False
 
 # ───────────────────── HTTP session (MEXC/Binance) ─────────────────────
@@ -135,8 +160,12 @@ async def _send_async(text: str):
     if not TG_TOKEN or not TG_CHAT:
         print("⚠️ TELEGRAM_TOKEN/CHAT_ID не заданы. Сообщение:", text)
         return
-    async with Bot(TG_TOKEN) as bot:
-        await bot.send_message(chat_id=TG_CHAT, text=text, disable_web_page_preview=True)
+    try:
+        async with Bot(TG_TOKEN) as bot:
+            await bot.send_message(chat_id=TG_CHAT, text=text, disable_web_page_preview=True)
+        print("📤 Message sent to Telegram successfully")
+    except Exception as e:
+        print(f"❌ Telegram send error: {e}")
 
 def send_msg(text: str):
     try:
@@ -213,8 +242,10 @@ def _fmt_signal_text(side: str, meta: dict, bar_ts: pd.Timestamp) -> str:
     head = "🟢 BUY" if side == "buy" else "🔴 SELL"
     p    = float(meta["price"])
     when = fmt_time_local(bar_ts)
+    signal_id = f"#{int(time.time())}"  # Уникальный ID для каждого сигнала
+    
     return (
-        f"{head}  #{meta['symbol']} ({meta['interval']}) | {when}\n"
+        f"{head}  #{meta['symbol']} ({meta['interval']}) {signal_id} | {when}\n"
         f"price={p:.5f}  adx={meta['adx']:.1f}  atr%={meta['atr_pc']:.2f}%  regime={meta['regime']}\n"
         f"HTF: up={meta['htf_up']} dn={meta['htf_dn']}  "
         f"Donchian: H={meta['don_hi_prev']:.5f}  L={meta['don_lo_prev']:.5f}"
@@ -361,7 +392,7 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
     }
     return side, meta
 
-# ─────────────────────────── Task ───────────────────────────
+# ─────────────────────────── Task (улучшенная логика) ───────────────────────────
 class Task:
     def __init__(self, label: str, poll_delay: int, mexc_symbol: str, mexc_interval: str):
         self.label = label
@@ -373,6 +404,7 @@ class Task:
         self.last_msg_index: int | None = None
         self.msgs_today = 0
         self.cur_day = None
+        self.processed_bars = set()  # Дополнительная защита от повторной обработки баров
 
     def _ok_limits(self, df_len: int) -> bool:
         now_local = datetime.now(tz=TZ_LOCAL)
@@ -380,46 +412,88 @@ class Task:
         if self.cur_day != d:
             self.cur_day = d
             self.msgs_today = 0
+            self.processed_bars.clear()  # Очищаем при смене дня
+            
         if self.msgs_today >= MAX_TRADES_DAY:
+            print(f"📊 Daily limit reached: {self.msgs_today}/{MAX_TRADES_DAY}")
             return False
+            
         if self.last_msg_index is None:
             return True
-        return (df_len - self.last_msg_index) >= COOLDOWN_BARS
+            
+        bars_since_last = df_len - self.last_msg_index
+        if bars_since_last < COOLDOWN_BARS:
+            print(f"⏳ Cooldown active: {bars_since_last}/{COOLDOWN_BARS} bars")
+            return False
+            
+        return True
 
     def tick(self):
         now = time.time()
         if now - self.last_tick_ts < self.poll_delay:
             return
         self.last_tick_ts = now
+        
         try:
             df = load_klines(self.mexc_symbol, self.mexc_interval)
             if df.empty:
+                print("📊 Empty dataframe received")
                 return
-            lt = df.index[-1]
-            if self.last_bar_time is not None and lt <= self.last_bar_time:
+                
+            current_bar_time = df.index[-1]
+            current_bar_key = current_bar_time.isoformat()
+            
+            # Проверяем, обрабатывали ли уже этот бар
+            if current_bar_key in self.processed_bars:
+                return
+                
+            # Проверяем, изменилось ли время последнего бара
+            if self.last_bar_time is not None and current_bar_time <= self.last_bar_time:
                 return
 
+            print(f"🔄 Processing new bar: {current_bar_time}")
             htf = interval_to_htf(self.mexc_interval)
             df_htf = load_klines(self.mexc_symbol, htf)
 
             side, meta = make_signal(df, df_htf)
 
-            if side and self._ok_limits(len(df)) and in_session(datetime.now(timezone.utc)):
-                if not _already_sent(side, lt):
-                    text = _fmt_signal_text(side, meta, lt)
+            session_ok = in_session(datetime.now(timezone.utc))
+            limits_ok = self._ok_limits(len(df))
+            
+            print(f"📊 Signal: {side or 'None'} | Session: {session_ok} | Limits: {limits_ok}")
+
+            if side and limits_ok and session_ok:
+                # Используем улучшенную проверку дублей с ценой
+                if not _already_sent(side, current_bar_time, meta["price"]):
+                    text = _fmt_signal_text(side, meta, current_bar_time)
+                    print("📤 Sending signal:")
                     print(text)
                     send_msg(text)
+                    
                     self.last_msg_index = len(df)
                     self.msgs_today += 1
+                    self.processed_bars.add(current_bar_key)
+                    
+                    print(f"✅ Signal sent successfully. Daily count: {self.msgs_today}/{MAX_TRADES_DAY}")
                 else:
-                    print(f"[{self.label}] duplicate signal skipped | {side} @ {lt}")
+                    print(f"🚫 Signal blocked as duplicate: {side} @ {current_bar_time}")
             else:
-                print(f"[{self.label}] no signal | bar {lt}")
+                reasons = []
+                if not side: reasons.append("no_signal")
+                if not limits_ok: reasons.append("limits")
+                if not session_ok: reasons.append("session")
+                print(f"⏸️  Signal skipped: {' + '.join(reasons)} | bar {current_bar_time}")
 
-            self.last_bar_time = lt
+            self.last_bar_time = current_bar_time
+            self.processed_bars.add(current_bar_key)
+            
+            # Ограничиваем размер set'а обработанных баров
+            if len(self.processed_bars) > 1000:
+                old_bars = sorted(self.processed_bars)[:500]  # Удаляем старые
+                self.processed_bars -= set(old_bars)
 
         except Exception as e:
-            print(f"[{self.label}] Ошибка: {e}")
+            print(f"❌ [{self.label}] Error: {e}")
 
 # ─────────────────────────── Воркер ───────────────────────────
 def run_worker():
@@ -429,8 +503,10 @@ def run_worker():
         mexc_symbol=MEXC_SYMBOL,
         mexc_interval=MEXC_INTERVAL,
     )
-    print(f"Бот запущен. Источник: MEXC spot klines (с fallback). TZ: {TZ_NAME}")
-    # Стартового сообщения в Telegram НЕТ — убрано намеренно.
+    print(f"🚀 Bot started. Source: MEXC spot klines (with fallback). TZ: {TZ_NAME}")
+    print(f"📊 Settings: Symbol={MEXC_SYMBOL}, Interval={MEXC_INTERVAL}, Max daily trades={MAX_TRADES_DAY}")
+    print(f"⏰ Session time: {SESSION}, Cooldown: {COOLDOWN_BARS} bars")
+    
     while True:
         task.tick()
         time.sleep(1)
@@ -461,21 +537,20 @@ def root():
 def health():
     return JSONResponse({"ok": True, "ts": int(time.time()), "tz": TZ_NAME})
 
+@app.get("/state")
+def get_state():
+    """Новая ручка для проверки состояния"""
+    try:
+        if SIG_STATE.exists():
+            state = json.loads(SIG_STATE.read_text())
+        else:
+            state = {"status": "no_state_file"}
+        return JSONResponse(state)
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+
 # Тест-ручка: шлёт в Telegram фиктивный BUY
 @app.get("/test_sig")
 def test_sig():
     dummy = {
-        "symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL, "price": 123.45678,
-        "adx": 25.0, "atr_pc": 1.23, "regime": "trend",
-        "htf_up": True, "htf_dn": False,
-        "don_hi_prev": 1.0, "don_lo_prev": 0.9
-    }
-    now_bar = pd.Timestamp.utcnow().tz_localize("UTC")
-    text = _fmt_signal_text("buy", dummy, now_bar)
-    send_msg(text)
-    return {"ok": True}
-
-# ─────────────────────────── Script mode ───────────────────────────
-if __name__ == "__main__":
-    run_worker()
-
+        "symbol": MEXC_SYMBOL
