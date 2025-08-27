@@ -61,7 +61,7 @@ try:
 except Exception:
     TZ_LOCAL = ZoneInfo("Europe/Belgrade")
 
-# ─────────────────────── Файлы состояния (улучшенная защита от дублей) ───────────────────────
+# ─────────────────────── Файлы состояния (только для антидубля сигналов) ───────────────────────
 def _ensure_dir(p: pathlib.Path) -> pathlib.Path:
     try:
         p.mkdir(parents=True, exist_ok=True)
@@ -79,53 +79,28 @@ STATE_DIR = _ensure_dir(STATE_DIR)
 
 SIG_STATE = pathlib.Path(os.getenv("SIG_STATE_FILE", str(STATE_DIR / "mexc_last_signal.json")))
 
-def _already_sent(side: str, bar_ts: pd.Timestamp, price: float) -> bool:
-    """
-    Улучшенная защита от дублей: проверяем side, время бара, цену и добавляем минимальный интервал
-    """
+def _already_sent(side: str, bar_ts: pd.Timestamp) -> bool:
+    """True если такой же сигнал уже слали на этом баре (переживает рестарты)."""
     try:
-        if SIG_STATE.exists():
-            st = json.loads(SIG_STATE.read_text())
-            
-            # Строгая проверка всех параметров
-            if (
-                st.get("side") == side
-                and st.get("bar") == bar_ts.isoformat()
-                and st.get("symbol") == MEXC_SYMBOL
-                and st.get("interval") == MEXC_INTERVAL
-                and abs(st.get("price", 0) - price) < 0.00001  # Проверка цены с точностью
-            ):
-                print(f"🚫 Duplicate signal blocked: {side} at {bar_ts} price={price}")
-                return True
-                
-            # Дополнительная защита: минимум 1 минута между одинаковыми сигналами
-            last_time = st.get("timestamp", 0)
-            if (
-                st.get("side") == side 
-                and time.time() - last_time < 60  # минимум 60 секунд между сигналами
-                and st.get("symbol") == MEXC_SYMBOL
-            ):
-                print(f"⏰ Signal too frequent: {side} (last: {last_time})")
-                return True
-                
-    except Exception as e:
-        print(f"Warning: state file read error: {e}")
-    
-    # Записываем новое состояние
+        st = json.loads(SIG_STATE.read_text())
+        if (
+            st.get("side") == side
+            and st.get("bar") == bar_ts.isoformat()
+            and st.get("symbol") == MEXC_SYMBOL
+            and st.get("interval") == MEXC_INTERVAL
+        ):
+            return True
+    except Exception:
+        pass
     try:
-        new_state = {
+        SIG_STATE.write_text(json.dumps({
             "side": side,
             "bar": bar_ts.isoformat(),
             "symbol": MEXC_SYMBOL,
             "interval": MEXC_INTERVAL,
-            "price": price,
-            "timestamp": time.time()
-        }
-        SIG_STATE.write_text(json.dumps(new_state, indent=2))
-        print(f"✅ New signal state saved: {side} at {bar_ts}")
-    except Exception as e:
-        print(f"Warning: state file write error: {e}")
-        
+        }))
+    except Exception:
+        pass
     return False
 
 # ───────────────────── HTTP session (MEXC/Binance) ─────────────────────
@@ -160,12 +135,8 @@ async def _send_async(text: str):
     if not TG_TOKEN or not TG_CHAT:
         print("⚠️ TELEGRAM_TOKEN/CHAT_ID не заданы. Сообщение:", text)
         return
-    try:
-        async with Bot(TG_TOKEN) as bot:
-            await bot.send_message(chat_id=TG_CHAT, text=text, disable_web_page_preview=True)
-        print("📤 Message sent to Telegram successfully")
-    except Exception as e:
-        print(f"❌ Telegram send error: {e}")
+    async with Bot(TG_TOKEN) as bot:
+        await bot.send_message(chat_id=TG_CHAT, text=text, disable_web_page_preview=True)
 
 def send_msg(text: str):
     try:
@@ -242,10 +213,8 @@ def _fmt_signal_text(side: str, meta: dict, bar_ts: pd.Timestamp) -> str:
     head = "🟢 BUY" if side == "buy" else "🔴 SELL"
     p    = float(meta["price"])
     when = fmt_time_local(bar_ts)
-    signal_id = f"#{int(time.time())}"  # Уникальный ID для каждого сигнала
-    
     return (
-        f"{head}  #{meta['symbol']} ({meta['interval']}) {signal_id} | {when}\n"
+        f"{head}  #{meta['symbol']} ({meta['interval']}) | {when}\n"
         f"price={p:.5f}  adx={meta['adx']:.1f}  atr%={meta['atr_pc']:.2f}%  regime={meta['regime']}\n"
         f"HTF: up={meta['htf_up']} dn={meta['htf_dn']}  "
         f"Donchian: H={meta['don_hi_prev']:.5f}  L={meta['don_lo_prev']:.5f}"
@@ -327,7 +296,7 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"All klines sources failed: {e}")
 
-# ─────────────────────────── Стратегия (исправленная логика) ───────────────────────────
+# ─────────────────────────── Стратегия ───────────────────────────
 def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, dict]:
     df = df_ltf.copy()
     df["ema50"]  = ema(df["c"], 50)
@@ -360,51 +329,24 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
     long_break  = c > (don_hi_prev + BUF_ATR * atr)
     short_break = c < (don_lo_prev - BUF_ATR * atr)
 
-    # Основные условия для трендовых сигналов
     go_long  = htf_up and trend_up and atr_ok and adx_ok and far_slow and long_break
     go_short = htf_dn and trend_dn and atr_ok and adx_ok and far_slow and short_break
 
     side = None
     regime = "trend"
-    
-    # ИСПРАВЛЕННАЯ ЛОГИКА: четкие приоритеты
     if go_long and not go_short:
         side = "buy"
-        print(f"🔍 TREND BUY: htf_up={htf_up}, trend_up={trend_up}, adx={adx:.1f}>={ADX_MIN}, long_break={long_break}")
     elif go_short and not go_long:
-        side = "sell" 
-        print(f"🔍 TREND SELL: htf_dn={htf_dn}, trend_dn={trend_dn}, adx={adx:.1f}>={ADX_MIN}, short_break={short_break}")
-    elif USE_MR and not adx_ok:  # Mean reversion только при слабом тренде
+        side = "sell"
+    elif USE_MR and not adx_ok:
         regime = "range"
         dev = DEV_ATR * atr
         long_mr  = (c < ema50 - dev) and (rsi_v < RSI_LOW)
         short_mr = (c > ema50 + dev) and (rsi_v > RSI_HIGH)
-        
         if long_mr and not short_mr:
             side = "buy"
-            print(f"🔍 RANGE BUY: c={c:.5f} < ema50-dev={ema50-dev:.5f}, rsi={rsi_v:.1f} < {RSI_LOW}")
         elif short_mr and not long_mr:
             side = "sell"
-            print(f"🔍 RANGE SELL: c={c:.5f} > ema50+dev={ema50+dev:.5f}, rsi={rsi_v:.1f} > {RSI_HIGH}")
-        else:
-            print(f"🔍 RANGE: no signal (c={c:.5f}, ema50={ema50:.5f}, dev={dev:.5f}, rsi={rsi_v:.1f})")
-    else:
-        # Детальная диагностика почему нет сигнала
-        reasons = []
-        if not htf_up and not htf_dn: reasons.append("htf_neutral")
-        if not trend_up and not trend_dn: reasons.append("ltf_neutral") 
-        if not atr_ok: reasons.append(f"atr_low({atr/c*100:.2f}%<{ATR_MIN_PC*100}%)")
-        if not adx_ok: reasons.append(f"adx_low({adx:.1f}<{ADX_MIN})")
-        if not far_slow: reasons.append("close_to_ema200")
-        if not long_break and not short_break: reasons.append("no_donchian_break")
-        
-        print(f"🔍 NO SIGNAL: {', '.join(reasons) if reasons else 'unknown'}")
-
-    # Дополнительная диагностика
-    print(f"📊 Values: c={c:.5f}, ema50={ema50:.5f}, ema200={ema200:.5f}")
-    print(f"📊 Donchian: H={don_hi_prev:.5f} (break={don_hi_prev + BUF_ATR * atr:.5f})")
-    print(f"📊 Donchian: L={don_lo_prev:.5f} (break={don_lo_prev - BUF_ATR * atr:.5f})")
-    print(f"📊 HTF: up={htf_up}, dn={htf_dn} | LTF: up={trend_up}, dn={trend_dn}")
 
     meta = {
         "symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL, "price": float(c),
@@ -415,12 +357,11 @@ def make_signal(df_ltf: pd.DataFrame, df_htf: pd.DataFrame) -> tuple[str|None, d
         "trend_up": bool(trend_up), "trend_dn": bool(trend_dn),
         "atr_ok": bool(atr_ok), "adx_ok": bool(adx_ok), "far_slow": bool(far_slow),
         "don_hi_prev": float(don_hi_prev), "don_lo_prev": float(don_lo_prev),
-        "long_break": bool(long_break), "short_break": bool(short_break),
         "regime": regime,
     }
     return side, meta
 
-# ─────────────────────────── Task (улучшенная логика) ───────────────────────────
+# ─────────────────────────── Task ───────────────────────────
 class Task:
     def __init__(self, label: str, poll_delay: int, mexc_symbol: str, mexc_interval: str):
         self.label = label
@@ -432,7 +373,6 @@ class Task:
         self.last_msg_index: int | None = None
         self.msgs_today = 0
         self.cur_day = None
-        self.processed_bars = set()  # Дополнительная защита от повторной обработки баров
 
     def _ok_limits(self, df_len: int) -> bool:
         now_local = datetime.now(tz=TZ_LOCAL)
@@ -440,122 +380,101 @@ class Task:
         if self.cur_day != d:
             self.cur_day = d
             self.msgs_today = 0
-            self.processed_bars.clear()  # Очищаем при смене дня
-            
         if self.msgs_today >= MAX_TRADES_DAY:
-            print(f"📊 Daily limit reached: {self.msgs_today}/{MAX_TRADES_DAY}")
             return False
-            
         if self.last_msg_index is None:
             return True
-            
-        bars_since_last = df_len - self.last_msg_index
-        if bars_since_last < COOLDOWN_BARS:
-            print(f"⏳ Cooldown active: {bars_since_last}/{COOLDOWN_BARS} bars")
-            return False
-            
-        return True
+        return (df_len - self.last_msg_index) >= COOLDOWN_BARS
 
     def tick(self):
         now = time.time()
         if now - self.last_tick_ts < self.poll_delay:
             return
         self.last_tick_ts = now
-        
         try:
             df = load_klines(self.mexc_symbol, self.mexc_interval)
             if df.empty:
-                print("📊 Empty dataframe received")
                 return
-                
-            current_bar_time = df.index[-1]
-            current_bar_key = current_bar_time.isoformat()
-            
-            # Проверяем, обрабатывали ли уже этот бар
-            if current_bar_key in self.processed_bars:
-                return
-                
-            # Проверяем, изменилось ли время последнего бара
-            if self.last_bar_time is not None and current_bar_time <= self.last_bar_time:
+            lt = df.index[-1]
+            if self.last_bar_time is not None and lt <= self.last_bar_time:
                 return
 
-            print(f"🔄 Processing new bar: {current_bar_time}")
             htf = interval_to_htf(self.mexc_interval)
             df_htf = load_klines(self.mexc_symbol, htf)
 
             side, meta = make_signal(df, df_htf)
 
-            session_ok = in_session(datetime.now(timezone.utc))
-            limits_ok = self._ok_limits(len(df))
-            
-            print(f"📊 Signal: {side or 'None'} | Session: {session_ok} | Limits: {limits_ok}")
-
-            if side and limits_ok and session_ok:
-                # Используем улучшенную проверку дублей с ценой
-                if not _already_sent(side, current_bar_time, meta["price"]):
-                    text = _fmt_signal_text(side, meta, current_bar_time)
-                    print("📤 Sending signal:")
+            if side and self._ok_limits(len(df)) and in_session(datetime.now(timezone.utc)):
+                if not _already_sent(side, lt):
+                    text = _fmt_signal_text(side, meta, lt)
                     print(text)
                     send_msg(text)
-                    
                     self.last_msg_index = len(df)
                     self.msgs_today += 1
-                    self.processed_bars.add(current_bar_key)
-                    
-                    print(f"✅ Signal sent successfully. Daily count: {self.msgs_today}/{MAX_TRADES_DAY}")
                 else:
-                    print(f"🚫 Signal blocked as duplicate: {side} @ {current_bar_time}")
+                    print(f"[{self.label}] duplicate signal skipped | {side} @ {lt}")
             else:
-                reasons = []
-                if not side: reasons.append("no_signal")
-                if not limits_ok: reasons.append("limits")
-                if not session_ok: reasons.append("session")
-                print(f"⏸️  Signal skipped: {' + '.join(reasons)} | bar {current_bar_time}")
+                print(f"[{self.label}] no signal | bar {lt}")
 
-            self.last_bar_time = current_bar_time
-            self.processed_bars.add(current_bar_key)
-            
-            # Ограничиваем размер set'а обработанных баров
-            if len(self.processed_bars) > 1000:
-                old_bars = sorted(self.processed_bars)[:500]  # Удаляем старые
-                self.processed_bars -= set(old_bars)
+            self.last_bar_time = lt
 
         except Exception as e:
-            print(f"❌ [{self.label}] Error: {e}")
+            print(f"[{self.label}] Ошибка: {e}")
 
 # ─────────────────────────── Воркер ───────────────────────────
 def run_worker():
-    task = Task("mexc", POLL_DELAY, MEXC_SYMBOL, MEXC_INTERVAL)
+    task = Task(
+        label=f"{MEXC_SYMBOL} ({MEXC_INTERVAL})",
+        poll_delay=POLL_DELAY,
+        mexc_symbol=MEXC_SYMBOL,
+        mexc_interval=MEXC_INTERVAL,
+    )
+    print(f"Бот запущен. Источник: MEXC spot klines (с fallback). TZ: {TZ_NAME}")
+    # Стартового сообщения в Telegram НЕТ — убрано намеренно.
     while True:
-        try:
-            task.tick()
-        except Exception as e:
-            print(f"[worker] error: {e}")
+        task.tick()
         time.sleep(1)
 
-# ─────────────────────────── ASGI (FastAPI) ───────────────────────────
+# ─────────────────────────── FastAPI (keep-alive) ───────────────────────────
 app = FastAPI()
+_worker_started = False
+_worker_lock = threading.Lock()
 
-@app.get("/")
-def index():
-    return {
-        "ok": True,
-        "service": "mexc-telegram-bot",
-        "symbol": MEXC_SYMBOL,
-        "interval": MEXC_INTERVAL,
-        "time": datetime.now(tz=TZ_LOCAL).isoformat(),
-    }
-
-@app.get("/health")
-def health():
-    return {"ok": True}
+def start_worker_once():
+    global _worker_started
+    with _worker_lock:
+        if _worker_started:
+            return
+        t = threading.Thread(target=run_worker, daemon=True)
+        t.start()
+        _worker_started = True
 
 @app.on_event("startup")
 def _startup():
-    t = threading.Thread(target=run_worker, daemon=True)
-    t.start()
-    print("✅ background worker started")
+    start_worker_once()
 
-if __name__ == "__main__":  # локальный запуск: python bot.py
-    print("▶ running locally (no web server)")
+@app.get("/")
+def root():
+    return {"ok": True, "service": "mexc-telegram-bot", "symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL}
+
+@app.get("/health")
+def health():
+    return JSONResponse({"ok": True, "ts": int(time.time()), "tz": TZ_NAME})
+
+# Тест-ручка: шлёт в Telegram фиктивный BUY
+@app.get("/test_sig")
+def test_sig():
+    dummy = {
+        "symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL, "price": 123.45678,
+        "adx": 25.0, "atr_pc": 1.23, "regime": "trend",
+        "htf_up": True, "htf_dn": False,
+        "don_hi_prev": 1.0, "don_lo_prev": 0.9
+    }
+    now_bar = pd.Timestamp.utcnow().tz_localize("UTC")
+    text = _fmt_signal_text("buy", dummy, now_bar)
+    send_msg(text)
+    return {"ok": True}
+
+# ─────────────────────────── Script mode ───────────────────────────
+if __name__ == "__main__":
     run_worker()
