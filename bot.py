@@ -30,6 +30,11 @@ load_dotenv(override=True)
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# ↓ ВРЕМЕННЫЙ САМО-ТЕСТ (можно потом удалить)
+def _mask(s: str, keep_tail: int = 4) -> str:
+    return (s[:8] + "..." + s[-keep_tail:]) if s else ""
+print("TG_TOKEN set?", bool(TG_TOKEN), "| TG_CHAT:", TG_CHAT, "| token:", _mask(TG_TOKEN))
+
 MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
 MEXC_INTERVAL = os.getenv("MEXC_INTERVAL", "15m").strip()   # дефолт 15 минут
 
