@@ -470,8 +470,7 @@ def test_sig():
         "htf_up": True, "htf_dn": False,
         "don_hi_prev": 1.0, "don_lo_prev": 0.9
     }
-    # FIX: избегаем ошибки "Cannot localize tz-aware Timestamp"
-    now_bar = pd.Timestamp.now(tz=timezone.utc)
+    now_bar = pd.Timestamp.utcnow().tz_localize("UTC")
     text = _fmt_signal_text("buy", dummy, now_bar)
     send_msg(text)
     return {"ok": True}
