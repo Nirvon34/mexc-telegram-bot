@@ -524,7 +524,7 @@ def test_sig():
         "htf_up": True, "htf_dn": False,
         "don_hi_prev": 1.0, "don_lo_prev": 0.9
     }
-    now_bar = pd.Timestamp.utcnow().tz_localize("UTC")
+    now_bar = pd.Timestamp.utcnow().tz_localize("now_bar = pd.Timestamp.now(tz="UTC")UTC")
     text = _fmt_signal_text("buy", dummy, now_bar)
     ok = send_msg(text)
     return {"ok": ok, "sent": f"BUY #{sym} ({itv})"}
