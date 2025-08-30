@@ -483,34 +483,48 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
                 return _df_from_k(arr)
         raise RuntimeError(f"mexc v3 status {r.status_code}")
     except Exception as e:
-        print("v3 failed → v2:", e)
+        print(f"v3 failed → v2: {e}")
 
     # 2) MEXC open/api v2
     try:
         url_v2 = "https://www.mexc.com/open/api/v2/market/kline"
         sym_v2 = symbol if "_" in symbol else symbol.replace("USDT", "_USDT")
         i_map = {
-            "1m":"Min1","3m":"Min3","5m":"Min5","15m":"Min15","30m":"Min30",
-            "1h":"Hour1","2h":"Hour2","4h":"Hour4","6h":"Hour6","8h":"Hour8","12h":"Hour12",
-            "1d":"Day1","1w":"Week1","1M":"Month1"
+            "1m": "Min1", "3m": "Min3", "5m": "Min5", "15m": "Min15", "30m": "Min30",
+            "1h": "Hour1", "2h": "Hour2", "4h": "Hour4", "6h": "Hour6", "8h": "Hour8", "12h": "Hour12",
+            "1d": "Day1", "1w": "Week1", "1M": "Month1",
         }
-        i_v2 = i_map.get(interval.lower(), "Min15")   # дефолтно 15m
-        r2 = SESSION_HTTP.get(url_v2, params={"symbol": sym_v2, "interval": i_v2, "limit": limit}, timeout=20)
+        i_v2 = i_map.get(interval.lower(), "Min15")
+        r2 = SESSION_HTTP.get(
+            url_v2,
+            params={"symbol": sym_v2, "interval": i_v2, "limit": limit},
+            timeout=20,
+        )
         if r2.status_code == 200:
             js = r2.json()
-            arr = js.get("data", [])
+            arr = js.get("data", []) if isinstance(js, dict) else []
             if arr:
-                data = [[int(a["t"])*1000, float(a["o"]), float(a["h"]), float(a["l"]),
+                data = [[int(a["t"]) * 1000, float(a["o"]), float(a["h"]), float(a["l"]),
                          float(a["c"]), float(a["v"]), 0, 0] for a in arr]
                 print(f"[klines] MEXC v2 | {symbol} {interval}")
                 return _df_from_k(data)
         raise RuntimeError(f"mexc v2 status {r2.status_code}")
     except Exception as e:
-        print("v2 failed → binance:", e)
+        print(f"v2 failed → binance: {e}")
 
     # 3) Binance v3
     try:
         r3 = SESSION_HTTP.get(
             "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": interval,
-
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=20,
+        )
+        r3.raise_for_status()
+        arr = r3.json()
+        if not isinstance(arr, list) or not arr:
+            raise RuntimeError("binance empty")
+        data = [[a[0], a[1], a[2], a[3], a[4], a[5], a[6], 0] for a in arr]
+        print(f"[klines] Binance v3 | {symbol} {interval}")
+        return _df_from_k(data)
+    except Exception as e:
+        raise RuntimeError(f"All klines sources failed: {e}")
