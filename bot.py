@@ -516,7 +516,6 @@ def health():
 
 @app.get("/test_sig")
 def test_sig():
-    # берём первую пару; если мультипары нет — fallback
     sym, itv = PAIRS[0] if PAIRS else (MEXC_SYMBOL_OLD, MEXC_INTERVAL_OLD)
     dummy = {
         "symbol": sym, "interval": itv, "price": 123.45678,
@@ -524,7 +523,7 @@ def test_sig():
         "htf_up": True, "htf_dn": False,
         "don_hi_prev": 1.0, "don_lo_prev": 0.9
     }
-    now_bar = pd.Timestamp.utcnow().tz_localize("now_bar = pd.Timestamp.now(tz="UTC")UTC")
+    now_bar = pd.Timestamp.now(tz="UTC")
     text = _fmt_signal_text("buy", dummy, now_bar)
     ok = send_msg(text)
     return {"ok": ok, "sent": f"BUY #{sym} ({itv})"}
