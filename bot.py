@@ -168,20 +168,32 @@ def make_session() -> requests.Session:
 
 SESSION_HTTP = make_session()
 
-# ─────────────────────────── Telegram ───────────────────────────
-async def _send_async(text: str):
+# ─────────────────────────── Telegram (safe) ───────────────────────────
+async def _send_async(text: str) -> bool:
+    """Безопасная отправка: возвращает True/False вместо исключения."""
     if not TG_TOKEN or not TG_CHAT:
         print("⚠️ TELEGRAM_TOKEN/CHAT_ID не заданы. Сообщение:", text)
-        return
-    async with Bot(TG_TOKEN) as bot:
-        await bot.send_message(chat_id=TG_CHAT, text=text, disable_web_page_preview=True)
-
-def send_msg(text: str):
+        return False
     try:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except Exception:
-        pass
-    asyncio.run(_send_async(text))
+        async with Bot(TG_TOKEN) as bot:
+            chat_id = int(TG_CHAT) if TG_CHAT.lstrip("-").isdigit() else TG_CHAT
+            await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+        return True
+    except Exception as e:
+        print(f"[telegram] send failed: {e}")
+        return False
+
+def send_msg(text: str) -> bool:
+    """Синхронная оболочка, тоже безопасная."""
+    try:
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except Exception:
+            pass
+        return asyncio.run(_send_async(text))
+    except Exception as e:
+        print(f"[telegram] run error: {e}")
+        return False
 
 # ─────────────────────────── helpers ───────────────────────────
 def drop_unclosed_last_bar(df: pd.DataFrame) -> pd.DataFrame:
@@ -504,7 +516,8 @@ def health():
 
 @app.get("/test_sig")
 def test_sig():
-    sym, itv = PAIRS[0]
+    # берём первую пару; если мультипары нет — fallback
+    sym, itv = PAIRS[0] if PAIRS else (MEXC_SYMBOL_OLD, MEXC_INTERVAL_OLD)
     dummy = {
         "symbol": sym, "interval": itv, "price": 123.45678,
         "adx": 25.0, "atr_pc": 1.23, "regime": "trend",
@@ -513,8 +526,8 @@ def test_sig():
     }
     now_bar = pd.Timestamp.utcnow().tz_localize("UTC")
     text = _fmt_signal_text("buy", dummy, now_bar)
-    send_msg(text)
-    return {"ok": True, "sent": f"BUY #{sym} ({itv})"}
+    ok = send_msg(text)
+    return {"ok": ok, "sent": f"BUY #{sym} ({itv})"}
 
 # ─────────────────────────── Script mode ───────────────────────────
 if __name__ == "__main__":
