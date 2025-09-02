@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# MA Cross 5/10 → Telegram (messages only)
+# MA(5) x MA(10) → Telegram (messages only)
 # Источник свечей: MEXC v3 → MEXC v2 → Binance v3 (fallback)
 # Локально: python bot.py
 # Веб:     uvicorn bot:app --host 0.0.0.0 --port $PORT
@@ -31,10 +31,8 @@ TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 MEXC_SYMBOL   = os.getenv("MEXC_SYMBOL", "EURUSDT").strip()
-# Фиксируем ТФ на 30 минут, чтобы соответствовать задаче
-MEXC_INTERVAL = "30m"
+MEXC_INTERVAL = "30m"  # фикс по задаче
 
-# Параметры антиспама/сессии
 SESSION        = os.getenv("SESSION", "0700-1800").strip()
 COOLDOWN_BARS  = int(os.getenv("COOLDOWN_BARS", "40"))
 MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_DAY", "2"))
@@ -46,7 +44,7 @@ try:
 except Exception:
     TZ_LOCAL = ZoneInfo("Europe/Belgrade")
 
-# ─────────────────────── Файлы состояния (антидубль) ───────────────────────
+# ─────────────────────── Файлы состояния ───────────────────────
 def _ensure_dir(p: pathlib.Path) -> pathlib.Path:
     try:
         p.mkdir(parents=True, exist_ok=True)
@@ -64,13 +62,12 @@ STATE_DIR = _ensure_dir(STATE_DIR)
 
 SIG_STATE = pathlib.Path(os.getenv("SIG_STATE_FILE", str(STATE_DIR / "mexc_last_signal.json")))
 
-def _already_sent(side: str, bar_ts: pd.Timestamp) -> bool:
-    """True если такой же сигнал уже слали на этом баре (переживает рестарты)."""
+def _already_sent(side: str, bar_ts) -> bool:
     try:
         st = json.loads(SIG_STATE.read_text())
         if (
             st.get("side") == side
-            and st.get("bar") == bar_ts.isoformat()
+            and st.get("bar") == (bar_ts.isoformat() if hasattr(bar_ts, "isoformat") else str(bar_ts))
             and st.get("symbol") == MEXC_SYMBOL
             and st.get("interval") == MEXC_INTERVAL
         ):
@@ -80,7 +77,7 @@ def _already_sent(side: str, bar_ts: pd.Timestamp) -> bool:
     try:
         SIG_STATE.write_text(json.dumps({
             "side": side,
-            "bar": bar_ts.isoformat(),
+            "bar": bar_ts.isoformat() if hasattr(bar_ts, "isoformat") else str(bar_ts),
             "symbol": MEXC_SYMBOL,
             "interval": MEXC_INTERVAL,
         }))
@@ -124,22 +121,26 @@ async def _send_async(text: str):
         await bot.send_message(chat_id=TG_CHAT, text=text, disable_web_page_preview=True)
 
 def send_msg(text: str):
-    try:
+    # отправка в фоне, чтобы ручки не падали
+    def _runner():
         try:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        except Exception:
-            pass
-        asyncio.run(_send_async(text))
-    except Exception as e:
-        # Безопасно логируем, чтобы ручки FastAPI не падали
-        print(f"[telegram] send error: {e}")
+            asyncio.run(_send_async(text))
+        except Exception as e:
+            print(f"[telegram] send error: {e}")
+    threading.Thread(target=_runner, daemon=True).start()
 
 # ─────────────────────────── helpers ───────────────────────────
 def drop_unclosed_last_bar(df: pd.DataFrame) -> pd.DataFrame:
     return df.iloc[:-1] if df is not None and len(df) >= 1 else df
 
-def fmt_time_local(ts_utc: datetime | pd.Timestamp) -> str:
-    dt = ts_utc.to_pydatetime().replace(tzinfo=timezone.utc) if isinstance(ts_utc, pd.Timestamp) else ts_utc.replace(tzinfo=timezone.utc)
+def fmt_time_local(ts_utc):
+    # принимает datetime или pandas.Timestamp (aware/naive)
+    if hasattr(ts_utc, "to_pydatetime"):
+        dt = ts_utc.to_pydatetime()
+    else:
+        dt = ts_utc
+    if getattr(dt, "tzinfo", None) is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(TZ_LOCAL).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def in_session(now: datetime) -> bool:
@@ -161,15 +162,14 @@ def normalize_interval(interval: str) -> str:
     i = (interval or "").strip()
     return i if i in valid else "30m"
 
-# ─────────────────────────── Формат текста ───────────────────────────
-def _fmt_signal_text(side: str, meta: dict, bar_ts: pd.Timestamp) -> str:
+# ─────────────────────────── Текст сигнала ───────────────────────────
+def _fmt_signal_text(side: str, meta: dict, bar_ts) -> str:
     head = "🟢 BUY" if side == "buy" else "🔴 SELL"
     p    = float(meta["price"])
     when = fmt_time_local(bar_ts)
-    cross = meta.get("cross", "")
     return (
         f"{head}  #{meta['symbol']} ({meta['interval']}) | {when}\n"
-        f"price={p:.5f}  ma5={meta['ma5']:.5f}  ma10={meta['ma10']:.5f}  cross={cross}"
+        f"price={p:.5f}  ma5={meta['ma5']:.5f}  ma10={meta['ma10']:.5f}  cross={meta.get('cross','')}"
     )
 
 # ─────────────────────────── KLINES ───────────────────────────
@@ -185,7 +185,7 @@ def _df_from_k(arr) -> pd.DataFrame:
     df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
     df[["o","h","l","c"]] = df[["o","h","l","c"]].astype(float)
     df = df[["t","o","h","l","c"]].set_index("t").sort_index()
-    df = drop_unclosed_last_bar(df)  # работаем только с закрытыми барами
+    df = drop_unclosed_last_bar(df)
     df["complete"] = True
     return df
 
@@ -249,8 +249,7 @@ def load_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
         raise RuntimeError(f"All klines sources failed: {e}")
 
 # ─────────────────────────── Стратегия: MA(5) x MA(10) ───────────────────────────
-def make_signal(df_ltf: pd.DataFrame) -> tuple[str|None, dict]:
-    # Требуется хотя бы 10 баров для корректной SMA(10)
+def make_signal(df_ltf: pd.DataFrame):
     if df_ltf is None or len(df_ltf) < 11:
         return None, {}
 
@@ -258,20 +257,17 @@ def make_signal(df_ltf: pd.DataFrame) -> tuple[str|None, dict]:
     df["ma5"]  = sma(df["c"], 5)
     df["ma10"] = sma(df["c"], 10)
 
-    # Проверка пересечения на последнем закрытом баре
-    ma5     = df["ma5"].iloc[-1]
-    ma10    = df["ma10"].iloc[-1]
+    ma5       = df["ma5"].iloc[-1]
+    ma10      = df["ma10"].iloc[-1]
     ma5_prev  = df["ma5"].iloc[-2]
     ma10_prev = df["ma10"].iloc[-2]
 
     side = None
     cross = None
     if (ma5 > ma10) and (ma5_prev <= ma10_prev):
-        side = "buy"
-        cross = "up"
+        side, cross = "buy", "up"
     elif (ma5 < ma10) and (ma5_prev >= ma10_prev):
-        side = "sell"
-        cross = "down"
+        side, cross = "sell", "down"
 
     meta = {
         "symbol": MEXC_SYMBOL,
@@ -292,7 +288,7 @@ class Task:
         self.mexc_interval = mexc_interval
         self.last_bar_time = None
         self.last_tick_ts = 0.0
-        self.last_msg_index: int | None = None
+        self.last_msg_index = None
         self.msgs_today = 0
         self.cur_day = None
 
@@ -349,12 +345,11 @@ def run_worker():
         mexc_interval=MEXC_INTERVAL,
     )
     print(f"Бот запущен. Источник: MEXC spot klines (с fallback). TZ: {TZ_NAME}")
-    # Стартового сообщения в Telegram НЕТ — намеренно.
     while True:
         task.tick()
         time.sleep(1)
 
-# ─────────────────────────── FastAPI (keep-alive) ───────────────────────────
+# ─────────────────────────── FastAPI ───────────────────────────
 app = FastAPI()
 _worker_started = False
 _worker_lock = threading.Lock()
@@ -380,21 +375,18 @@ def root():
 def health():
     return JSONResponse({"ok": True, "ts": int(time.time()), "tz": TZ_NAME})
 
-# Тест-ручка: шлёт в Telegram фиктивный BUY по MA-кроссу
+# ВАЖНО: без pandas, с явным JSONResponse и 200 даже при ошибке
 @app.get("/test_sig")
 def test_sig():
-    now_bar = pd.Timestamp.utcnow().tz_localize("UTC")
-    dummy = {
-        "symbol": MEXC_SYMBOL,
-        "interval": MEXC_INTERVAL,
-        "price": 123.45678,
-        "ma5": 123.50000,
-        "ma10": 123.40000,
-        "cross": "up",
-    }
-    text = _fmt_signal_text("buy", dummy, now_bar)
-    send_msg(text)
-    return {"ok": True}
+    try:
+        now_bar = datetime.now(timezone.utc)
+        dummy = {"symbol": MEXC_SYMBOL, "interval": MEXC_INTERVAL, "price": 123.45678, "ma5": 123.50, "ma10": 123.40, "cross": "up"}
+        text = _fmt_signal_text("buy", dummy, now_bar)
+        send_msg(text)
+        return JSONResponse({"ok": True, "sent": True}, status_code=200)
+    except Exception as e:
+        print(f"/test_sig error: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
 
 # ─────────────────────────── Script mode ───────────────────────────
 if __name__ == "__main__":
