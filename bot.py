@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 # SA_VWAP 1h-style (window High/Low breakout with tolerance) → Telegram (messages only)
+# FX: Yahoo Finance (EURUSD=X, GBPJPY=X …) · CRYPTO: MEXC v3 → MEXC v2 → Binance v3
 
 import os
 import time
 import json
+import random
 import asyncio
 import threading
 import pathlib
@@ -28,7 +30,7 @@ load_dotenv(override=True)
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Поддержка нескольких инструментов (через запятую)
+# Несколько инструментов (через запятую)
 MULTI_SYMBOLS = [s.strip().upper() for s in os.getenv("MULTI_SYMBOLS", "EURUSD,GBPJPY,LTCUSDT").split(",") if s.strip()]
 
 # Интервал (допустимы 1m,3m,5m,15m,20m,30m,45m,1h,2h,4h,6h,8h,12h,1d,1w,1M)
@@ -117,14 +119,14 @@ def make_session() -> requests.Session:
 
 SESSION_HTTP = make_session()
 
-# ── простейший rate-limit для Yahoo (не чаще, чем раз в 2.5с на процесс)
+# ── rate-limit для Yahoo (между вызовами 8–11с на процесс)
 _YAHOO_LAST = 0.0
-def _yahoo_rl(min_gap=2.5):
+def _yahoo_rl(min_gap=8.0, jitter=3.0):
     global _YAHOO_LAST
     now = time.time()
-    dt = now - _YAHOO_LAST
-    if dt < min_gap:
-        time.sleep(min_gap - dt)
+    remain = min_gap - (now - _YAHOO_LAST)
+    if remain > 0:
+        time.sleep(remain + random.random() * jitter)
     _YAHOO_LAST = time.time()
 
 # ─────────────────────────── Telegram ───────────────────────────
@@ -210,31 +212,53 @@ def load_klines_yahoo_fx(symbol: str, interval: str, range_str: str = "30d") -> 
       https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X?interval={interval}&range=30d
     """
     ysym = to_yahoo_fx(symbol)
-    i = normalize_interval(interval)
-    if i == "1h":                 # у Yahoo часовики = 60m
-        i = "60m"
+    i_int = normalize_interval(interval)
+    if i_int == "1h":                 # у Yahoo часовой – это 60m
+        i_int = "60m"
+
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + ysym
-    params = {"interval": i, "range": range_str}
-    _yahoo_rl(2.5)                # простая задержка перед каждым вызовом Yahoo
-    r = SESSION_HTTP.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    js = r.json()
+    params = {"interval": i_int, "range": range_str}
+
+    resp = None
+    for attempt in range(5):
+        _yahoo_rl(8.0, 3.0)  # гарантированный зазор + джиттер
+        r = SESSION_HTTP.get(url, params=params, timeout=20)
+        code = r.status_code
+        if code == 429:
+            sleep = min(60, 3.0 * (2 ** attempt))
+            print(f"[yahoo] 429 rate-limited → sleep {sleep:.1f}s (attempt {attempt+1}/5)")
+            time.sleep(sleep)
+            continue
+        if code in (500, 502, 503, 504, 403):
+            sleep = min(30, 2.0 * (2 ** attempt))
+            print(f"[yahoo] {code} → retry after {sleep:.1f}s (attempt {attempt+1}/5)")
+            time.sleep(sleep)
+            continue
+        r.raise_for_status()
+        resp = r
+        break
+    if resp is None:
+        raise RuntimeError(f"yahoo rate-limited after retries for {symbol} {i_int}")
+
+    js = resp.json()
     res = js.get("chart", {}).get("result", [])
     if not res:
-        raise RuntimeError("yahoo empty")
+        raise RuntimeError("yahoo rows empty")
     result = res[0]
     ts = result.get("timestamp", [])
     ind = result.get("indicators", {})
     q = (ind.get("quote") or [{}])[0]
     o, h, l, c = q.get("open", []), q.get("high", []), q.get("low", []), q.get("close", [])
+
     rows = []
-    for i in range(min(len(ts), len(o), len(h), len(l), len(c))):
-        if None in (ts[i], o[i], h[i], l[i], c[i]):
+    for k in range(min(len(ts), len(o), len(h), len(l), len(c))):
+        if None in (ts[k], o[k], h[k], l[k], c[k]):
             continue
-        rows.append([int(ts[i])*1000, float(o[i]), float(h[i]), float(l[i]), float(c[i])])
-    if not rows:
+        rows.append([int(ts[k]) * 1000, float(o[k]), float(h[k]), float(l[k]), float(c[k])])
+
+    df = pd.DataFrame(rows, columns=["t", "o", "h", "l", "c"])
+    if df.empty:
         raise RuntimeError("yahoo rows empty")
-    df = pd.DataFrame(rows, columns=["t","o","h","l","c"])
     df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
     df = df.set_index("t").sort_index()
     df = drop_unclosed_last_bar(df)
@@ -259,14 +283,14 @@ def _df_from_k(arr) -> pd.DataFrame:
     return df
 
 def load_klines_crypto(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
-    interval = normalize_interval(interval)
+    i_int = normalize_interval(interval)
     sym = symbol.replace("/", "").upper()
 
     # 1) MEXC v3
     try:
         r = SESSION_HTTP.get(
             "https://api.mexc.com/api/v3/klines",
-            params={"symbol": sym, "interval": interval, "limit": limit},
+            params={"symbol": sym, "interval": i_int, "limit": limit},
             timeout=20,
         )
         if r.status_code == 200:
@@ -287,7 +311,7 @@ def load_klines_crypto(symbol: str, interval: str, limit: int = 1000) -> pd.Data
             "1h":"Hour1","2h":"Hour2","4h":"Hour4","6h":"Hour6","8h":"Hour8","12h":"Hour12",
             "1d":"Day1","1w":"Week1","1M":"Month1"
         }
-        i_v2 = i_map.get(interval.lower(), "Min30")
+        i_v2 = i_map.get(i_int.lower(), "Min30")
         r2 = SESSION_HTTP.get(url_v2, params={"symbol": sym_v2, "interval": i_v2, "limit": limit}, timeout=20)
         if r2.status_code == 200:
             js = r2.json()
@@ -305,7 +329,7 @@ def load_klines_crypto(symbol: str, interval: str, limit: int = 1000) -> pd.Data
     try:
         r3 = SESSION_HTTP.get(
             "https://api.binance.com/api/v3/klines",
-            params={"symbol": sym, "interval": interval, "limit": limit},
+            params={"symbol": sym, "interval": i_int, "limit": limit},
             timeout=20,
         )
         r3.raise_for_status()
@@ -421,13 +445,14 @@ class Task:
 
 # ─────────────────────────── Воркер ───────────────────────────
 def run_worker():
-    # рассинхрон стартов, чтобы не долбить Yahoo/биржи одновременно
+    # рассинхрон стартов, чтобы не долбить источники одновременно
     tasks = []
     base = time.time()
-    for i, s in enumerate(MULTI_SYMBOLS):
-        t = Task(symbol=s, interval=INTERVAL, poll_delay=POLL_DELAY)
-        # сдвигаем первый опрос для каждого инструмента на i*3 сек
-        t.last_tick_ts = base - (POLL_DELAY - min(3 * i, max(POLL_DELAY - 1, 1)))
+    for idx, sym in enumerate(MULTI_SYMBOLS):
+        t = Task(symbol=sym, interval=INTERVAL, poll_delay=POLL_DELAY)
+        # сдвигаем первый опрос для каждого инструмента на 10s * idx (но не позднее чем через POLL_DELAY-1)
+        initial_offset = min(max(POLL_DELAY - 1, 1), 10 * idx)
+        t.last_tick_ts = base - (POLL_DELAY - initial_offset)
         tasks.append(t)
 
     print(f"Бот запущен. TZ: {TZ_NAME} | symbols: {', '.join(MULTI_SYMBOLS)} | interval: {INTERVAL}")
