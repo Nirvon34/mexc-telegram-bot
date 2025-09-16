@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# SA_VWAP M45-style (window High/Low breakout with tolerance) → Telegram (messages only)
+# SA_VWAP 1h-style (window High/Low breakout with tolerance) → Telegram (messages only)
 # Источник свечей:
 #   - FX (EURUSD, GBPJPY и т.п.): Yahoo Finance chart API
 #   - CRYPTO (…USDT): MEXC v3 → MEXC v2 → Binance v3 (fallback)
@@ -36,8 +36,8 @@ TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # Поддержка нескольких инструментов (через запятую). По умолчанию три, как просили.
 MULTI_SYMBOLS = [s.strip().upper() for s in os.getenv("MULTI_SYMBOLS", "EURUSD,GBPJPY,LTCUSDT").split(",") if s.strip()]
 
-# Интервал берём общий (как в образце). Допускаются 1m,3m,5m,15m,20m,30m,45m,1h,4h,1d…
-INTERVAL = (os.getenv("INTERVAL", "") or os.getenv("MEXC_INTERVAL", "45m")).strip()
+# Интервал берём общий (допускаются 1m,3m,5m,15m,20m,30m,45m,1h,2h,4h,6h,8h,12h,1d,1w,1M)
+INTERVAL = (os.getenv("INTERVAL", "") or os.getenv("MEXC_INTERVAL", "1h")).strip()
 SESSION  = os.getenv("SESSION", "0000-2359").strip()  # 24/7 по умолчанию
 POLL_DELAY = int(os.getenv("POLL_DELAY", "60"))       # не опрашиваем чаще, чем раз в N секунд
 TZ_NAME    = os.getenv("TZ", "Europe/Belgrade").strip()
@@ -166,7 +166,7 @@ def in_session(now: datetime) -> bool:
 def normalize_interval(interval: str) -> str:
     valid = {"1m","3m","5m","15m","20m","30m","45m","1h","2h","4h","6h","8h","12h","1d","1w","1M"}
     i = (interval or "").strip()
-    return i if i in valid else "45m"
+    return i if i in valid else "1h"
 
 def is_fx(sym: str) -> bool:
     s = sym.replace("/", "")
@@ -208,9 +208,12 @@ def load_klines_yahoo_fx(symbol: str, interval: str, range_str: str = "30d") -> 
       https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X?interval={interval}&range=30d
     """
     ysym = to_yahoo_fx(symbol)
-    interval = normalize_interval(interval)
+    i = normalize_interval(interval)
+    # у Yahoo формат часов — 60m, а не 1h
+    if i == "1h":
+        i = "60m"
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + ysym
-    params = {"interval": interval, "range": range_str}
+    params = {"interval": i, "range": range_str}
     r = SESSION_HTTP.get(url, params=params, timeout=20)
     r.raise_for_status()
     js = r.json()
@@ -385,6 +388,7 @@ class Task:
     def __init__(self, symbol: str, interval: str, poll_delay: int):
         self.symbol = symbol
         self.interval = interval
+               # seconds since epoch
         self.poll_delay = poll_delay
         self.last_bar_time: Optional[pd.Timestamp] = None
         self.last_tick_ts = 0.0
