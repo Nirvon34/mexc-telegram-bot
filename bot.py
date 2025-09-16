@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
 # SA_VWAP 1h-style (window High/Low breakout with tolerance) → Telegram (messages only)
-# Источник свечей:
-#   - FX (EURUSD, GBPJPY и т.п.): Yahoo Finance chart API
-#   - CRYPTO (…USDT): MEXC v3 → MEXC v2 → Binance v3 (fallback)
-# Локально: python bot.py
-# Веб:     uvicorn bot:app --host 0.0.0.0 --port $PORT
 
 import os
 import time
@@ -33,16 +28,16 @@ load_dotenv(override=True)
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Поддержка нескольких инструментов (через запятую). По умолчанию три, как просили.
+# Поддержка нескольких инструментов (через запятую)
 MULTI_SYMBOLS = [s.strip().upper() for s in os.getenv("MULTI_SYMBOLS", "EURUSD,GBPJPY,LTCUSDT").split(",") if s.strip()]
 
-# Интервал берём общий (допускаются 1m,3m,5m,15m,20m,30m,45m,1h,2h,4h,6h,8h,12h,1d,1w,1M)
-INTERVAL = (os.getenv("INTERVAL", "") or os.getenv("MEXC_INTERVAL", "1h")).strip()
-SESSION  = os.getenv("SESSION", "0000-2359").strip()  # 24/7 по умолчанию
-POLL_DELAY = int(os.getenv("POLL_DELAY", "60"))       # не опрашиваем чаще, чем раз в N секунд
+# Интервал (допустимы 1m,3m,5m,15m,20m,30m,45m,1h,2h,4h,6h,8h,12h,1d,1w,1M)
+INTERVAL   = (os.getenv("INTERVAL", "") or os.getenv("MEXC_INTERVAL", "1h")).strip()
+SESSION    = os.getenv("SESSION", "0000-2359").strip()  # 24/7
+POLL_DELAY = int(os.getenv("POLL_DELAY", "60"))         # сек между попытками опроса
 TZ_NAME    = os.getenv("TZ", "Europe/Belgrade").strip()
 
-# Параметры индикатора (как в вашем MQL4)
+# Параметры логики
 LENGTH    = int(os.getenv("LENGTH", "180"))
 TOL_PIPS  = float(os.getenv("TOL_PIPS", "1.0"))
 
@@ -122,6 +117,16 @@ def make_session() -> requests.Session:
 
 SESSION_HTTP = make_session()
 
+# ── простейший rate-limit для Yahoo (не чаще, чем раз в 2.5с на процесс)
+_YAHOO_LAST = 0.0
+def _yahoo_rl(min_gap=2.5):
+    global _YAHOO_LAST
+    now = time.time()
+    dt = now - _YAHOO_LAST
+    if dt < min_gap:
+        time.sleep(min_gap - dt)
+    _YAHOO_LAST = time.time()
+
 # ─────────────────────────── Telegram ───────────────────────────
 async def _send_async(text: str):
     if not TG_TOKEN or not TG_CHAT:
@@ -160,7 +165,6 @@ def in_session(now: datetime) -> bool:
         t = local.hour*60 + local.minute
         return (sh*60 + sm) <= t <= (eh*60 + em)
     except Exception:
-        # если SESSION битый — не ограничиваем
         return True
 
 def normalize_interval(interval: str) -> str:
@@ -181,7 +185,6 @@ def decimals_for(symbol: str, price: float) -> int:
         return 3
     if len(s) == 6:
         return 5
-    # crypto heuristic
     if price >= 100:
         return 2
     if price >= 1:
@@ -194,7 +197,6 @@ def pip_for(symbol: str, price: float) -> float:
         return 0.01
     if len(s) == 6:
         return 0.0001
-    # crypto heuristic
     if price >= 100:
         return 0.1
     if price >= 1:
@@ -209,11 +211,11 @@ def load_klines_yahoo_fx(symbol: str, interval: str, range_str: str = "30d") -> 
     """
     ysym = to_yahoo_fx(symbol)
     i = normalize_interval(interval)
-    # у Yahoo формат часов — 60m, а не 1h
-    if i == "1h":
+    if i == "1h":                 # у Yahoo часовики = 60m
         i = "60m"
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + ysym
     params = {"interval": i, "range": range_str}
+    _yahoo_rl(2.5)                # простая задержка перед каждым вызовом Yahoo
     r = SESSION_HTTP.get(url, params=params, timeout=20)
     r.raise_for_status()
     js = r.json()
@@ -225,7 +227,6 @@ def load_klines_yahoo_fx(symbol: str, interval: str, range_str: str = "30d") -> 
     ind = result.get("indicators", {})
     q = (ind.get("quote") or [{}])[0]
     o, h, l, c = q.get("open", []), q.get("high", []), q.get("low", []), q.get("close", [])
-    # фильтруем None
     rows = []
     for i in range(min(len(ts), len(o), len(h), len(l), len(c))):
         if None in (ts[i], o[i], h[i], l[i], c[i]):
@@ -322,20 +323,14 @@ def load_klines(symbol: str, interval: str) -> pd.DataFrame:
         return load_klines_yahoo_fx(symbol, interval, range_str="30d")
     return load_klines_crypto(symbol, interval)
 
-# ─────────────────────────── ЛОГИКА СИГНАЛА (как в MQL4) ───────────────────────────
+# ─────────────────────────── ЛОГИКА СИГНАЛА ───────────────────────────
 def sawvap_last_signal(df: pd.DataFrame, symbol: str, interval: str, length: int, tol_pips: float):
-    """
-    Возвращает (side, meta, bar_time) только для последнего закрытого бара.
-    side ∈ {"buy","sell", None}
-    """
     if df is None or len(df) < (length + 3):
         return None, {}, None
 
-    # rolling окна по High/Low
     roll_high = df["h"].rolling(length, min_periods=length).max()
     roll_low  = df["l"].rolling(length, min_periods=length).min()
 
-    # текущий и предыдущий окна (h, h1) / (l, l1), hi/lo prev/curr
     h   = roll_high
     h1  = roll_high.shift(1)
     l   = roll_low
@@ -346,7 +341,6 @@ def sawvap_last_signal(df: pd.DataFrame, symbol: str, interval: str, length: int
     lo_prev = df["l"].shift(1)
     lo_curr = df["l"]
 
-    # толеранс в абсолютных ценах через "pip"
     last_price = float(df["c"].iloc[-1])
     pip = pip_for(symbol, last_price)
     eps = tol_pips * pip
@@ -354,7 +348,6 @@ def sawvap_last_signal(df: pd.DataFrame, symbol: str, interval: str, length: int
     isSELL = (np.abs(hi_prev - h1) <= eps) & (hi_curr < (h - eps))
     isBUY  = (np.abs(lo_prev - l1) <= eps) & (lo_curr > (l + eps))
 
-    # берём самый последний закрытый бар
     bar_time = df.index[-1]
     sell = bool(isSELL.iloc[-1])
     buy  = bool(isBUY.iloc[-1])
@@ -388,7 +381,6 @@ class Task:
     def __init__(self, symbol: str, interval: str, poll_delay: int):
         self.symbol = symbol
         self.interval = interval
-               # seconds since epoch
         self.poll_delay = poll_delay
         self.last_bar_time: Optional[pd.Timestamp] = None
         self.last_tick_ts = 0.0
@@ -429,7 +421,15 @@ class Task:
 
 # ─────────────────────────── Воркер ───────────────────────────
 def run_worker():
-    tasks = [Task(symbol=s, interval=INTERVAL, poll_delay=POLL_DELAY) for s in MULTI_SYMBOLS]
+    # рассинхрон стартов, чтобы не долбить Yahoo/биржи одновременно
+    tasks = []
+    base = time.time()
+    for i, s in enumerate(MULTI_SYMBOLS):
+        t = Task(symbol=s, interval=INTERVAL, poll_delay=POLL_DELAY)
+        # сдвигаем первый опрос для каждого инструмента на i*3 сек
+        t.last_tick_ts = base - (POLL_DELAY - min(3 * i, max(POLL_DELAY - 1, 1)))
+        tasks.append(t)
+
     print(f"Бот запущен. TZ: {TZ_NAME} | symbols: {', '.join(MULTI_SYMBOLS)} | interval: {INTERVAL}")
     while True:
         for t in tasks:
@@ -456,7 +456,7 @@ def _startup():
 
 @app.get("/")
 def root():
-    start_worker_once()  # на всякий случай
+    start_worker_once()
     return {"ok": True, "service": "sawvap-telegram-bot", "symbols": MULTI_SYMBOLS, "interval": INTERVAL}
 
 @app.get("/health")
