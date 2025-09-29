@@ -22,7 +22,7 @@ from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from telegram import Bot
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
 # ─────────────────────────── ENV ───────────────────────────
@@ -30,8 +30,8 @@ load_dotenv(override=True)
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Несколько инструментов (через запятую)
-MULTI_SYMBOLS = [s.strip().upper() for s in os.getenv("MULTI_SYMBOLS", "EURUSD,GBPJPY,LTCUSDT").split(",") if s.strip()]
+# Только одна пара
+MULTI_SYMBOLS = ["EURUSDT"]
 
 # Интервал (допустимы 1m,3m,5m,15m,20m,30m,45m,1h,2h,4h,6h,8h,12h,1d,1w,1M)
 INTERVAL   = (os.getenv("INTERVAL", "") or os.getenv("MEXC_INTERVAL", "1h")).strip()
@@ -484,9 +484,18 @@ def root():
     start_worker_once()
     return {"ok": True, "service": "sawvap-telegram-bot", "symbols": MULTI_SYMBOLS, "interval": INTERVAL}
 
+@app.head("/")
+def root_head():
+    start_worker_once()
+    return Response(status_code=200)
+
 @app.get("/health")
 def health():
     return JSONResponse({"ok": True, "ts": int(time.time()), "tz": TZ_NAME})
+
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
 
 @app.get("/test_sig")
 def test_sig():
