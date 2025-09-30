@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # SA_VWAP 1h-style (window High/Low breakout with tolerance) → Telegram (messages only)
-# FX: Yahoo Finance (EURUSD=X, GBPJPY=X …) · CRYPTO: MEXC v3 → MEXC v2 → Binance v3
+# FX: Yahoo Finance (EURUSD=X, GBPJPY=X …) · CRYPTO: MEXC v3 (spot/contract) → Binance v3
 
 import os
 import time
@@ -30,14 +30,15 @@ load_dotenv(override=True)
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Только одна пара
+# Только одна пара (можно расширить списком)
 MULTI_SYMBOLS = ["EURUSDT"]
 
-# Интервал (допустимы 1m,3m,5m,15m,20m,30m,45m,1h,2h,4h,6h,8h,12h,1d,1w,1M)
+# Интервал
 INTERVAL   = (os.getenv("INTERVAL", "") or os.getenv("MEXC_INTERVAL", "1h")).strip()
 SESSION    = os.getenv("SESSION", "0000-2359").strip()  # 24/7
 POLL_DELAY = int(os.getenv("POLL_DELAY", "60"))         # сек между попытками опроса
 TZ_NAME    = os.getenv("TZ", "Europe/Belgrade").strip()
+MEXC_MODE  = os.getenv("MEXC_MODE", "spot").strip().lower()  # spot | contract
 
 # Параметры логики
 LENGTH    = int(os.getenv("LENGTH", "180"))
@@ -119,7 +120,7 @@ def make_session() -> requests.Session:
 
 SESSION_HTTP = make_session()
 
-# ── rate-limit для Yahoo (между вызовами 8–11с на процесс)
+# ── rate-limit для Yahoo
 _YAHOO_LAST = 0.0
 def _yahoo_rl(min_gap=8.0, jitter=3.0):
     global _YAHOO_LAST
@@ -207,13 +208,9 @@ def pip_for(symbol: str, price: float) -> float:
 
 # ─────────────────────────── KLINES: FX (Yahoo) ───────────────────────────
 def load_klines_yahoo_fx(symbol: str, interval: str, range_str: str = "30d") -> pd.DataFrame:
-    """
-    Yahoo Finance chart API:
-      https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X?interval={interval}&range=30d
-    """
     ysym = to_yahoo_fx(symbol)
     i_int = normalize_interval(interval)
-    if i_int == "1h":                 # у Yahoo часовой – это 60m
+    if i_int == "1h":  # у Yahoo часовой – это 60m
         i_int = "60m"
 
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + ysym
@@ -221,7 +218,7 @@ def load_klines_yahoo_fx(symbol: str, interval: str, range_str: str = "30d") -> 
 
     resp = None
     for attempt in range(5):
-        _yahoo_rl(8.0, 3.0)  # гарантированный зазор + джиттер
+        _yahoo_rl(8.0, 3.0)
         r = SESSION_HTTP.get(url, params=params, timeout=20)
         code = r.status_code
         if code == 429:
@@ -265,7 +262,7 @@ def load_klines_yahoo_fx(symbol: str, interval: str, range_str: str = "30d") -> 
     df["complete"] = True
     return df
 
-# ─────────────────────────── KLINES: CRYPTO (MEXC/Binance) ───────────────────────────
+# ─────────────────────────── KLINES: CRYPTO ───────────────────────────
 def _df_from_k(arr) -> pd.DataFrame:
     row_len = len(arr[0])
     if row_len >= 12: cols = ["t","o","h","l","c","v","t2","q","n","tb","tq","ig"]
@@ -282,57 +279,71 @@ def _df_from_k(arr) -> pd.DataFrame:
     df["complete"] = True
     return df
 
+def _mexc_contract_symbol(sym_spot: str) -> str:
+    # EURUSDT -> EUR_USDT и т.п.
+    s = sym_spot.upper()
+    return s.replace("USDT", "_USDT") if "_USDT" not in s else s
+
+def _mexc_contract_interval(interval: str) -> str:
+    # Min1/3/5/15/30, Hour1/2/4/6/8/12, Day1, Week1, Month1
+    i = normalize_interval(interval)
+    m = {
+        "1m":"Min1","3m":"Min3","5m":"Min5","15m":"Min15","30m":"Min30",
+        "1h":"Hour1","2h":"Hour2","4h":"Hour4","6h":"Hour6","8h":"Hour8","12h":"Hour12",
+        "1d":"Day1","1w":"Week1","1M":"Month1"
+    }
+    return m.get(i, "Min30")
+
 def load_klines_crypto(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     i_int = normalize_interval(interval)
     sym = symbol.replace("/", "").upper()
 
-    # 1) MEXC v3
-    try:
-        r = SESSION_HTTP.get(
-            "https://api.mexc.com/api/v3/klines",
-            params={"symbol": sym, "interval": i_int, "limit": limit},
-            timeout=20,
-        )
-        if r.status_code == 200:
-            arr = r.json()
-            if isinstance(arr, list) and arr:
-                print(f"[klines] MEXC v3 {sym}")
-                return _df_from_k(arr)
-        raise RuntimeError(f"mexc v3 status {r.status_code}")
-    except Exception as e:
-        print(f"{sym} v3 failed → v2: {e}")
+    # 1) MEXC spot v3
+    if MEXC_MODE == "spot":
+        try:
+            r = SESSION_HTTP.get(
+                "https://api.mexc.com/api/v3/klines",
+                params={"symbol": sym, "interval": i_int, "limit": limit},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                arr = r.json()
+                if isinstance(arr, list) and arr:
+                    print(f"[klines] MEXC v3 spot {sym}")
+                    return _df_from_k(arr)
+            print(f"[warn] MEXC v3 spot {r.status_code}: {r.text[:300]}")
+        except Exception as e:
+            print(f"[warn] MEXC v3 spot exception: {e}")
 
-    # 2) MEXC open/api v2
-    try:
-        url_v2 = "https://www.mexc.com/open/api/v2/market/kline"
-        sym_v2 = sym if "_" in sym else sym.replace("USDT", "_USDT")
-        i_map = {
-            "1m":"Min1","3m":"Min3","5m":"Min5","15m":"Min15","30m":"Min30",
-            "1h":"Hour1","2h":"Hour2","4h":"Hour4","6h":"Hour6","8h":"Hour8","12h":"Hour12",
-            "1d":"Day1","1w":"Week1","1M":"Month1"
-        }
-        i_v2 = i_map.get(i_int.lower(), "Min30")
-        r2 = SESSION_HTTP.get(url_v2, params={"symbol": sym_v2, "interval": i_v2, "limit": limit}, timeout=20)
-        if r2.status_code == 200:
-            js = r2.json()
-            arr = js.get("data", [])
-            if arr:
-                data = [[int(a["t"])*1000, float(a["o"]), float(a["h"]), float(a["l"]),
-                         float(a["c"]), float(a["v"]), 0, 0] for a in arr]
-                print(f"[klines] MEXC v2 {sym}")
-                return _df_from_k(data)
-        raise RuntimeError(f"mexc v2 status {r2.status_code}")
-    except Exception as e:
-        print(f"{sym} v2 failed → binance: {e}")
+    # 2) MEXC contracts (фьючерсы)
+    if MEXC_MODE == "contract":
+        try:
+            url = "https://contract.mexc.com/api/v1/contract/kline"
+            sym_c = _mexc_contract_symbol(sym)
+            i_c   = _mexc_contract_interval(i_int)
+            r2 = SESSION_HTTP.get(url, params={"symbol": sym_c, "interval": i_c, "limit": limit}, timeout=20)
+            if r2.status_code == 200:
+                js = r2.json()
+                data_arr = js.get("data") or js.get("dataList") or []
+                if data_arr:
+                    data = [[int(a["t"])*1000, float(a["o"]), float(a["h"]), float(a["l"]), float(a["c"]), float(a.get("v",0)), 0, 0]
+                            for a in data_arr]
+                    print(f"[klines] MEXC contract {sym_c} {i_c}")
+                    return _df_from_k(data)
+            print(f"[warn] MEXC contract {r2.status_code}: {r2.text[:300]}")
+        except Exception as e:
+            print(f"[warn] MEXC contract exception: {e}")
 
-    # 3) Binance v3
+    # 3) Binance v3 (fallback)
     try:
         r3 = SESSION_HTTP.get(
             "https://api.binance.com/api/v3/klines",
             params={"symbol": sym, "interval": i_int, "limit": limit},
             timeout=20,
         )
-        r3.raise_for_status()
+        if r3.status_code != 200:
+            print(f"[warn] Binance v3 {r3.status_code}: {r3.text[:300]}")
+            r3.raise_for_status()
         arr = r3.json()
         if not arr:
             raise RuntimeError("binance empty")
@@ -455,7 +466,7 @@ def run_worker():
         t.last_tick_ts = base - (POLL_DELAY - initial_offset)
         tasks.append(t)
 
-    print(f"Бот запущен. TZ: {TZ_NAME} | symbols: {', '.join(MULTI_SYMBOLS)} | interval: {INTERVAL}")
+    print(f"Бот запущен. TZ: {TZ_NAME} | symbols: {', '.join(MULTI_SYMBOLS)} | interval: {INTERVAL} | mexc_mode={MEXC_MODE}")
     while True:
         for t in tasks:
             t.tick()
@@ -482,7 +493,7 @@ def _startup():
 @app.get("/")
 def root():
     start_worker_once()
-    return {"ok": True, "service": "sawvap-telegram-bot", "symbols": MULTI_SYMBOLS, "interval": INTERVAL}
+    return {"ok": True, "service": "sawvap-telegram-bot", "symbols": MULTI_SYMBOLS, "interval": INTERVAL, "mexc_mode": MEXC_MODE}
 
 @app.head("/")
 def root_head():
