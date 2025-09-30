@@ -279,6 +279,26 @@ def _df_from_k(arr) -> pd.DataFrame:
     df["complete"] = True
     return df
 
+# ── MEXC: мапперы
+def _mexc_spot_interval(interval: str) -> Optional[str]:
+    """
+    Интервалы, которые понимает MEXC spot v3.
+    1h -> 60m; «нестандартные» (3m,20m,45m,2h,6h,8h,12h) не поддерживаются.
+    """
+    i = normalize_interval(interval)
+    support = {
+        "1m": "1m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "60m",  # ВАЖНО
+        "4h": "4h",
+        "1d": "1d",
+        "1w": "1w",
+        "1M": "1M",
+    }
+    return support.get(i, None)
+
 def _mexc_contract_symbol(sym_spot: str) -> str:
     # EURUSDT -> EUR_USDT и т.п.
     s = sym_spot.upper()
@@ -298,24 +318,28 @@ def load_klines_crypto(symbol: str, interval: str, limit: int = 1000) -> pd.Data
     i_int = normalize_interval(interval)
     sym = symbol.replace("/", "").upper()
 
-    # 1) MEXC spot v3
+    # ───── 1) MEXC spot v3 ─────
     if MEXC_MODE == "spot":
         try:
-            r = SESSION_HTTP.get(
-                "https://api.mexc.com/api/v3/klines",
-                params={"symbol": sym, "interval": i_int, "limit": limit},
-                timeout=20,
-            )
-            if r.status_code == 200:
-                arr = r.json()
-                if isinstance(arr, list) and arr:
-                    print(f"[klines] MEXC v3 spot {sym}")
-                    return _df_from_k(arr)
-            print(f"[warn] MEXC v3 spot {r.status_code}: {r.text[:300]}")
+            i_m = _mexc_spot_interval(i_int)
+            if not i_m:
+                print(f"[info] MEXC v3 spot: interval '{i_int}' unsupported → skip to Binance")
+            else:
+                r = SESSION_HTTP.get(
+                    "https://api.mexc.com/api/v3/klines",
+                    params={"symbol": sym, "interval": i_m, "limit": limit},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    arr = r.json()
+                    if isinstance(arr, list) and arr:
+                        print(f"[klines] MEXC v3 spot {sym} ({i_m})")
+                        return _df_from_k(arr)
+                print(f"[warn] MEXC v3 spot {r.status_code}: {r.text[:300]}")
         except Exception as e:
             print(f"[warn] MEXC v3 spot exception: {e}")
 
-    # 2) MEXC contracts (фьючерсы)
+    # ───── 2) MEXC contracts (фьючерсы) ─────
     if MEXC_MODE == "contract":
         try:
             url = "https://contract.mexc.com/api/v1/contract/kline"
@@ -334,7 +358,7 @@ def load_klines_crypto(symbol: str, interval: str, limit: int = 1000) -> pd.Data
         except Exception as e:
             print(f"[warn] MEXC contract exception: {e}")
 
-    # 3) Binance v3 (fallback)
+    # ───── 3) Binance v3 (fallback) ─────
     try:
         r3 = SESSION_HTTP.get(
             "https://api.binance.com/api/v3/klines",
