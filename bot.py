@@ -11,10 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping Render (HEAD with retries, no-fail)
-        env:
-          URLS: |
-           
-            https://mexc-telegram-bot-1xd7.onrender.com/health
+      
         run: |
           set +e
           ok=0
