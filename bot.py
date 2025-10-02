@@ -13,7 +13,7 @@ jobs:
       - name: Ping Render (HEAD with retries, no-fail)
         env:
           URLS: |
-            https://mexc-telegram-bot-1xd7.onrender.com/
+           
             https://mexc-telegram-bot-1xd7.onrender.com/health
         run: |
           set +e
