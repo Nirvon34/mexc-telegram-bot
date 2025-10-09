@@ -2,23 +2,42 @@ name: Keep Render Awake
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
-  workflow_dispatch:
+    - cron: '*/10 * * * *'   # каждые 10 минут (UTC)
+  workflow_dispatch:          # ручной запуск из Actions
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
       - name: Ping Render service (HEAD)
+        shell: bash
         env:
           KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
         run: |
-          if [ -z "$KEEPALIVE_URL" ]; then echo "KEEPALIVE_URL empty"; exit 1; fi
-          echo "Pinging $KEEPALIVE_URL"
-          for i in 1 2 3 4 5; do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" -I "$KEEPALIVE_URL" || true)
+          set -euo pipefail
+
+          # Санитизация: убираем CRLF и пробелы по краям, чтобы не было "Malformed URL"
+          url="$(printf "%s" "$KEEPALIVE_URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+          if [ -z "$url" ]; then
+            echo "KEEPALIVE_URL empty"; exit 1
+          fi
+
+          echo "Pinging ***"   # сам URL скрыт GitHub'ом в логах
+
+          # До 5 попыток с нарастающей паузой
+          for i in {1..5}; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" -I "$url" || true)
             echo "Attempt $i → HTTP $code"
-            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then exit 0; fi
+
+            # успех: любой 2xx/3xx
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+              echo "OK"; exit 0
+            fi
+
             sleep $((i*10))
           done
-          exit 1
+
+          echo "Fail after retries"; exit 1
