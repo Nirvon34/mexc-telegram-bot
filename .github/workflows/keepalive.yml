@@ -1,0 +1,24 @@
+name: Keep Render Awake
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render service (HEAD)
+        env:
+          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
+        run: |
+          if [ -z "$KEEPALIVE_URL" ]; then echo "KEEPALIVE_URL empty"; exit 1; fi
+          echo "Pinging $KEEPALIVE_URL"
+          for i in 1 2 3 4 5; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" -I "$KEEPALIVE_URL" || true)
+            echo "Attempt $i → HTTP $code"
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then exit 0; fi
+            sleep $((i*10))
+          done
+          exit 1
